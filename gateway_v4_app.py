@@ -40,6 +40,13 @@ TOPIC_HOUSE_STATUS = "home/gateway/status"
 ROOT_TOPIC = "smarthome"
 APP_PUBLISH_INTERVAL_SEC = 5.0
 
+# [MỚI] Trạng thái bridge (cổng serial) báo cho app
+TOPIC_BRIDGE_STATE = f"{ROOT_TOPIC}/gateway/bridge/state"   # "ONLINE" | "OFFLINE" (retained)
+TOPIC_BRIDGE_ERROR = f"{ROOT_TOPIC}/gateway/bridge/error"   # nội dung lỗi (retained), rỗng khi bình thường
+TOPIC_GATEWAY_ERROR = f"{ROOT_TOPIC}/gateway/error"         # lỗi tức thời, vd lệnh không gửi được (không retained)
+BRIDGE_RETRY_SEC = 5.0                                      # chu kỳ tự thử mở lại cổng serial
+_BRIDGE_IMPACT = "Dữ liệu bếp/phòng ngủ và cảnh báo gas/cháy của 2 phòng này tạm thời không hoạt động."
+
 CONTROLLABLE_DEVICES = [
     ("living_room", "led"),
     ("living_room", "fan"),
@@ -105,6 +112,10 @@ _last_command = {}
 _mqtt_client = None
 _last_gas_alert = None
 _device_states = {}
+
+# [MỚI] Trạng thái bridge: None = chưa biết, True/False sau lần thử mở cổng đầu tiên
+_bridge_online = None
+_bridge_error = ""
 
 
 # ==========================================
@@ -172,11 +183,15 @@ def _publish_door_state_to_app():
 def publish_sensors_to_app():
     lr = living_room.state
 
-    # Living room
+    # Living room (không phụ thuộc bridge)
     _pub_sensor("living_room", "pir", "motion", lr.get("motion"))
     _pub_sensor("living_room", "dht", "temperature", lr.get("temp"))
     _pub_sensor("living_room", "dht", "humidity", lr.get("humid"))
     _pub_sensor("living_room", "reed", "open", lr.get("door_open"))   # [MỚI] cửa đang mở/đóng
+
+    # [MỚI] Bếp/phòng ngủ lấy qua bridge: mất bridge thì KHÔNG publish giá trị cũ như thể còn mới
+    if not _bridge_online:
+        return
 
     # Kitchen
     _pub_sensor("kitchen", "gas_sensor", "value", state["kit_gas_raw"])
@@ -215,20 +230,14 @@ def _normalize_switch_payload(raw: str):
     return None
 
 
-# Các cặp (room, device) đã có phần cứng thật.
-def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> bool:
-    if room == "kitchen" and device == "fan":
-        send_command("kitchen", "FAN_ON" if is_on else "FAN_OFF", force=True)
-        return True
-    if room == "kitchen" and device == "led":
-        send_command("kitchen", "LED_ON" if is_on else "LED_OFF", force=True)
-        return True
-    if room == "bedroom" and device == "fan":
-        send_command("bedroom", "FAN_ON" if is_on else "FAN_OFF", force=True)
-        return True
-    if room == "bedroom" and device == "led":
-        send_command("bedroom", "LED_ON" if is_on else "LED_OFF", force=True)
-        return True
+# [SỬA] Trả về chuỗi trạng thái thay vì True/False:
+#   "ok"          = đã gửi lệnh tới phần cứng
+#   "failed"      = có phần cứng nhưng không gửi được (bridge không kết nối)
+#   "unsupported" = chưa nối phần cứng thật
+def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> str:
+    if room in ("kitchen", "bedroom") and device in ("fan", "led"):
+        cmd = f"{device.upper()}_{'ON' if is_on else 'OFF'}"      # FAN_ON, FAN_OFF, LED_ON, LED_OFF
+        return "ok" if send_command(room, cmd, force=True) else "failed"
     if room == "living_room" and device == "door":
         # Quy ước: ON = mở khoá, OFF = khoá lại
         # Servo quay mất ~0.6 s nên chạy trong thread riêng, không chặn luồng MQTT
@@ -236,14 +245,14 @@ def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> bool:
             threading.Thread(target=living_room.unlock_door, kwargs={"source": "app"}, daemon=True).start()
         else:
             threading.Thread(target=living_room.lock_door, daemon=True).start()
-        return True
+        return "ok"
     if room == "living_room" and device == "fan":
         living_room.set_fan(is_on, source="app")
-        return True
+        return "ok"
     if room == "living_room" and device == "led":
         living_room.set_led(is_on, source="app")
-        return True
-    return False
+        return "ok"
+    return "unsupported"
 
 
 # Xử lý lệnh app publish vào smarthome/<room>/<device>/set
@@ -253,13 +262,21 @@ def _handle_app_command(room: str, device: str, raw_value: str):
         print(f"[WARN] Giá trị lệnh không hợp lệ: {ROOT_TOPIC}/{room}/{device}/set = {raw_value}")
         return
 
-    handled = _dispatch_hardware_command(room, device, value == "ON")
+    result = _dispatch_hardware_command(room, device, value == "ON")
+
+    # [MỚI] Lệnh không tới được phần cứng: báo lỗi cho app, KHÔNG xác nhận trạng thái giả
+    if result == "failed":
+        _notify_gateway_error(
+            f"Không gửi được lệnh {room}/{device} = {value}: bridge chưa kết nối."
+        )
+        return
+
     _device_states[(room, device)] = value
     _publish_device_state(room, device, value)
 
     print(f"🎮 Nhận lệnh: {ROOT_TOPIC}/{room}/{device}/set = {value}  →  "
           f"đã cập nhật {ROOT_TOPIC}/{room}/{device}/state")
-    if not handled:
+    if result == "unsupported":
         print(f"    (lưu ý: {room}/{device} chưa nối phần cứng thật, chỉ echo trạng thái cho app)")
 
 
@@ -283,6 +300,7 @@ def _on_mqtt_connect(client, userdata, flags, rc, properties=None):
     for topic in TOPIC_APP_CMD_SET:
         client.subscribe(topic)
     client.publish(TOPIC_HOUSE_STATUS, "online", qos=1, retain=True)
+    _publish_bridge_state()   # [MỚI] bridge có thể đã lỗi từ trước khi MQTT kết nối xong
 
 
 def _on_mqtt_message(client, userdata, msg):
@@ -356,10 +374,76 @@ def cleanup_mqtt():
 
 
 # ==========================================
+# [MỚI] BRIDGE (CỔNG SERIAL): MỞ / MẤT KẾT NỐI / BÁO LỖI CHO APP
+# ==========================================
+def _notify_gateway_error(message: str):
+    """Báo lỗi tức thời cho app (không retained: chỉ app đang mở mới nhận)."""
+    print(f"[ERROR] {message}")
+    _publish_raw(TOPIC_GATEWAY_ERROR, message, qos=1)
+
+
+def _publish_bridge_state():
+    """Gửi trạng thái bridge cho app. Retained để app mở lên sau vẫn thấy trạng thái hiện tại."""
+    if _bridge_online is None:
+        return
+    _publish_raw(TOPIC_BRIDGE_STATE, "ONLINE" if _bridge_online else "OFFLINE", qos=1, retain=True)
+    # Payload rỗng + retained = xoá thông báo lỗi cũ khi bridge đã hoạt động lại
+    _publish_raw(TOPIC_BRIDGE_ERROR, "" if _bridge_online else _bridge_error, qos=1, retain=True)
+
+
+def _set_bridge_state(online: bool, reason: str = ""):
+    """Đổi trạng thái bridge; chỉ log/publish khi có thay đổi (tránh lặp mỗi lần thử lại)."""
+    global _bridge_online, _bridge_error
+    if _bridge_online == online and _bridge_error == reason:
+        return
+    _bridge_online = online
+    _bridge_error = reason
+    if online:
+        print(f"[BRIDGE] Đã kết nối {PORT} @ {BAUD_RATE} baud.")
+    else:
+        print(f"[BRIDGE][ERROR] {reason}")
+    _publish_bridge_state()
+
+
+def _open_serial() -> bool:
+    """Thử mở cổng serial. Lỗi thì KHÔNG thoát gateway, chỉ báo cho app và để vòng lặp thử lại."""
+    global ser
+    try:
+        port = serial.Serial(PORT, BAUD_RATE, timeout=1)
+    except (serial.SerialException, OSError) as e:
+        ser = None
+        _set_bridge_state(False, f"Không kết nối được bridge ({PORT}): {e}. {_BRIDGE_IMPACT}")
+        return False
+
+    time.sleep(2)   # chờ ESP32 reset sau khi mở cổng
+    try:
+        port.reset_input_buffer()
+    except (serial.SerialException, OSError):
+        pass
+    ser = port
+    _set_bridge_state(True)
+    return True
+
+
+def _handle_bridge_lost(err):
+    """Bridge bị rút / lỗi I/O khi đang chạy: đóng cổng, báo app, vòng lặp chính sẽ tự thử lại."""
+    global ser
+    port, ser = ser, None
+    if port is not None:
+        try:
+            port.close()
+        except Exception:
+            pass
+    _set_bridge_state(False, f"Mất kết nối bridge ({PORT}): {err}. {_BRIDGE_IMPACT}")
+
+
+# ==========================================
 # LỆNH ĐIỀU KHIỂN QUA BRIDGE
 # ==========================================
-def send_command(target: str, cmd: str, force: bool = False):
-    global ser
+def send_command(target: str, cmd: str, force: bool = False) -> bool:
+    """Gửi lệnh xuống node qua bridge.
+    True  = đã gửi (hoặc bỏ qua vì vừa gửi đúng lệnh này gần đây).
+    False = không gửi được (lệnh sai, hoặc bridge không kết nối)."""
     allowed_targets = {"kitchen", "bedroom", "all"}
     allowed_cmds = {
         "FAN_ON", "FAN_OFF", "LED_ON", "LED_OFF",
@@ -372,20 +456,29 @@ def send_command(target: str, cmd: str, force: bool = False):
 
     if target not in allowed_targets or cmd not in allowed_cmds:
         print(f"[WARN] Lệnh không hợp lệ: {target}:{cmd}")
-        return
+        return False
 
     now = time.time()
     key = (target, cmd)
     if not force and now - _last_command.get(key, 0.0) < COMMAND_REPEAT_SEC:
-        return
+        return True
 
-    if ser is None or not ser.is_open:
-        print(f"[WARN] Chưa mở serial, bỏ qua lệnh: {target}:{cmd}")
-        return
+    port = ser
+    if port is None or not port.is_open:
+        # Lệnh tự động (báo cháy...) im lặng bỏ qua để không spam log; trạng thái bridge đã được báo riêng
+        if force:
+            print(f"[WARN] Bridge chưa kết nối, bỏ qua lệnh: {target}:{cmd}")
+        return False
 
-    ser.write((f"{target}:{cmd}\n").encode("utf-8"))
+    try:
+        port.write((f"{target}:{cmd}\n").encode("utf-8"))
+    except (serial.SerialException, OSError) as e:
+        _handle_bridge_lost(e)
+        return False
+
     _last_command[key] = now
     print(f"[CMD] Đã gửi: {target}:{cmd}")
+    return True
 
 
 def ack_fire_gas():
@@ -525,6 +618,12 @@ def _clear_fire_gas_alarm():
 
 def evaluate_fire_gas_context():
     global _danger_started_ts, _day_escalated
+
+    # [MỚI] Chưa có bridge thì không có dữ liệu bếp/phòng ngủ để đánh giá. Nếu đang KHÔNG báo động
+    # thì bỏ qua (tránh báo "gas an toàn" giả lên app). Nếu ĐANG báo động thì vẫn đánh giá tiếp
+    # để giữ nguyên báo động (an toàn hơn là tự tắt khi không còn dữ liệu).
+    if not _bridge_online and state["fire_gas_level"] == "CLEAR":
+        return
 
     now = time.time()
     if not _danger_detected():
@@ -703,7 +802,7 @@ def handle_signal(signum, frame):
 
 
 def main():
-    global ser, _living_room_thread
+    global _living_room_thread
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -714,16 +813,14 @@ def main():
     _living_room_thread = threading.Thread(target=living_room.run, daemon=True)
     _living_room_thread.start()
 
-    print(f"Đang kết nối {PORT} @ {BAUD_RATE} baud ...")
-
-    try:
-        ser = serial.Serial(PORT, BAUD_RATE, timeout=1)
-    except serial.SerialException as e:
-        print(f"[ERROR] Không mở được cổng: {e}")
-        return
-
-    time.sleep(2)
-    print("Sẵn sàng nhận dữ liệu.\n")
+    # [SỬA] Bridge có thể chưa cắm: thử mở 1 lần. Lỗi thì gateway VẪN CHẠY (phòng khách, MQTT, app)
+    # và cứ BRIDGE_RETRY_SEC giây tự thử lại, nên cắm bridge vào sau cũng được.
+    print(f"Đang kết nối bridge {PORT} @ {BAUD_RATE} baud ...")
+    if not _open_serial():
+        print("[INFO] Gateway vẫn chạy không có bridge, sẽ tự thử lại mỗi "
+              f"{BRIDGE_RETRY_SEC:.0f} giây.")
+    last_bridge_try = time.time()
+    print("Gateway sẵn sàng.\n")
 
     last_house_print = 0.0
     last_context_eval = 0.0
@@ -731,11 +828,25 @@ def main():
 
     try:
         while True:
-            if ser.in_waiting:
-                raw = ser.readline().decode("utf-8", errors="replace")
-                parse_data(raw)
-
             now = time.time()
+
+            # ---- Bridge: đọc dữ liệu, hoặc tự thử kết nối lại nếu chưa có / bị rút ----
+            port = ser
+            if port is None or not port.is_open:
+                if now - last_bridge_try >= BRIDGE_RETRY_SEC:
+                    last_bridge_try = now
+                    _open_serial()
+            else:
+                raw = None
+                try:
+                    if port.in_waiting:
+                        raw = port.readline().decode("utf-8", errors="replace")
+                except (serial.SerialException, OSError) as e:
+                    _handle_bridge_lost(e)
+                if raw:
+                    parse_data(raw)
+
+            now = time.time()   # _open_serial() có thể mất ~2 s
             if now - last_context_eval >= 1.0:
                 last_context_eval = now
                 evaluate_fire_gas_context()
@@ -748,7 +859,9 @@ def main():
                 last_house_print = now
                 lr = living_room.state
                 ts = datetime.now().strftime("%H:%M:%S")
+                bridge_txt = "OK" if _bridge_online else "MẤT"
                 print(f"[{ts}] =========== TOÀN NHÀ =========| "
+                      f"Bridge: {bridge_txt}  "
                       f"Kitchen: {state['kit_temp']}°C/{state['kit_humid']}%/"
                       f"gas={state['kit_gas_raw']}  "
                       f"Bedroom: {state['bed_temp']}°C/{state['bed_humid']}%  "
