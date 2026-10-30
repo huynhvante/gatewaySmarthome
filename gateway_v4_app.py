@@ -24,7 +24,7 @@ MQTT_HOST = "749e4310b50e423c8876f553789253da.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 MQTT_USERNAME = "hvt"
 # [SỬA] Không để mật khẩu trong code. Chạy: export MQTT_PASSWORD='...'
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "Vante10012004@")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 MQTT_CLIENT_ID = "raspi-home-gateway"
 
 # --- Topic điều khiển / trạng thái nội bộ (giữ nguyên) ---
@@ -36,13 +36,10 @@ TOPIC_FIRE_GAS = "home/fire_gas/alarm"
 TOPIC_FIRE_GAS_ACK = "home/fire_gas/ack"
 TOPIC_HOUSE_STATUS = "home/gateway/status"
 
-
-
-#  Topic cho app Android: smarthome/<room>/<device>/<metric>, payload là chuỗi thuần
+# Topic cho app Android: smarthome/<room>/<device>/<metric>, payload là chuỗi thuần
 ROOT_TOPIC = "smarthome"
 APP_PUBLISH_INTERVAL_SEC = 5.0
 
-# [SỬA] Chỉ subscribe đúng các thiết bị điều khiển được app hỗ trợ — không dùng wildcard.
 CONTROLLABLE_DEVICES = [
     ("living_room", "led"),
     ("living_room", "fan"),
@@ -106,8 +103,8 @@ _manual_ack_ts = 0.0
 _last_presence_ts = time.time()
 _last_command = {}
 _mqtt_client = None
-_last_gas_alert = None  
-_device_states = {} 
+_last_gas_alert = None
+_device_states = {}
 
 
 # ==========================================
@@ -147,12 +144,28 @@ def _publish_raw(topic: str, value, qos: int = 0, retain: bool = False):
     except Exception as e:
         print(f"[WARN] MQTT publish lỗi: {e}")
 
+
 def _pub_sensor(room: str, device: str, metric: str, value):
-    if value is None:          
+    if value is None:
         return
     if isinstance(value, bool):
-        value = int(value)    
+        value = int(value)
     _publish_raw(f"{ROOT_TOPIC}/{room}/{device}/{metric}", value)
+
+
+# Publish lại trạng thái cho app: smarthome/<room>/<device>/state (retained)
+def _publish_device_state(room: str, device: str, value: str):
+    _publish_raw(f"{ROOT_TOPIC}/{room}/{device}/state", value, qos=1, retain=True)
+
+
+# [MỚI] Đồng bộ trạng thái khoá cửa THẬT lên app (khoá tự lại sau vài giây, app cần biết)
+def _publish_door_state_to_app():
+    lr = living_room.state
+    value = "OFF" if lr.get("door_locked") else "ON"   # quy ước: ON = mở khoá, OFF = đã khoá
+    if _device_states.get(("living_room", "door")) == value:
+        return
+    _device_states[("living_room", "door")] = value
+    _publish_device_state("living_room", "door", value)
 
 
 # Gửi toàn bộ cảm biến theo đúng cấu trúc topic của app
@@ -163,14 +176,14 @@ def publish_sensors_to_app():
     _pub_sensor("living_room", "pir", "motion", lr.get("motion"))
     _pub_sensor("living_room", "dht", "temperature", lr.get("temp"))
     _pub_sensor("living_room", "dht", "humidity", lr.get("humid"))
-
+    _pub_sensor("living_room", "reed", "open", lr.get("door_open"))   # [MỚI] cửa đang mở/đóng
 
     # Kitchen
     _pub_sensor("kitchen", "gas_sensor", "value", state["kit_gas_raw"])
     _pub_sensor("kitchen", "dht", "temperature", state["kit_temp"])
     _pub_sensor("kitchen", "dht", "humidity", state["kit_humid"])
 
-    # Bedroom (chỉ gửi sau khi đã nhận gói đầu tiên, vì bed_motion mặc định là False)
+    # Bedroom
     if state["bed_light"] is not None:
         _pub_sensor("bedroom", "pir", "motion", state["bed_motion"])
         _pub_sensor("bedroom", "dht", "temperature", state["bed_temp"])
@@ -178,7 +191,7 @@ def publish_sensors_to_app():
         _pub_sensor("bedroom", "light_sensor", "lux", state["bed_light"])
 
 
-#  Alert gas: chỉ publish khi đổi trạng thái, retained để app mở lên vẫn thấy
+# Alert gas: chỉ publish khi đổi trạng thái, retained để app mở lên vẫn thấy
 def _publish_gas_alert(active: bool):
     global _last_gas_alert
     if active == _last_gas_alert:
@@ -192,7 +205,7 @@ def _publish_gas_alert(active: bool):
     )
 
 
-#  Chuẩn hoá payload lệnh: nhiều app gửi ON/OFF, 1/0, true/false...
+# Chuẩn hoá payload lệnh: nhiều app gửi ON/OFF, 1/0, true/false...
 def _normalize_switch_payload(raw: str):
     v = raw.strip().upper()
     if v in ("ON", "1", "TRUE", "OPEN", "UNLOCK"):
@@ -202,13 +215,7 @@ def _normalize_switch_payload(raw: str):
     return None
 
 
-#  Publish lại trạng thái cho app: smarthome/<room>/<device>/state (retained)
-def _publish_device_state(room: str, device: str, value: str):
-    _publish_raw(f"{ROOT_TOPIC}/{room}/{device}/state", value, qos=1, retain=True)
-
-
-#  Các cặp (room, device) đã có phần cứng thật, gắn lệnh thật xuống thiết bị.
-# Trả về True nếu đã có phần cứng xử lý (không cần cảnh báo "chưa có phần cứng").
+# Các cặp (room, device) đã có phần cứng thật.
 def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> bool:
     if room == "kitchen" and device == "fan":
         send_command("kitchen", "FAN_ON" if is_on else "FAN_OFF", force=True)
@@ -224,10 +231,11 @@ def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> bool:
         return True
     if room == "living_room" and device == "door":
         # Quy ước: ON = mở khoá, OFF = khoá lại
+        # Servo quay mất ~0.6 s nên chạy trong thread riêng, không chặn luồng MQTT
         if is_on:
-            living_room.unlock_door(source="app")
+            threading.Thread(target=living_room.unlock_door, kwargs={"source": "app"}, daemon=True).start()
         else:
-            living_room.lock_door()
+            threading.Thread(target=living_room.lock_door, daemon=True).start()
         return True
     if room == "living_room" and device == "fan":
         living_room.set_fan(is_on, source="app")
@@ -238,7 +246,7 @@ def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> bool:
     return False
 
 
-#  Xử lý lệnh app publish vào smarthome/<room>/<device>/set (room, device đã được xác định trước)
+# Xử lý lệnh app publish vào smarthome/<room>/<device>/set
 def _handle_app_command(room: str, device: str, raw_value: str):
     value = _normalize_switch_payload(raw_value)
     if value is None:
@@ -258,6 +266,7 @@ def _handle_app_command(room: str, device: str, raw_value: str):
 def _on_living_room_event(event_type: str, payload: dict):
     if event_type == "door_status":
         _publish(TOPIC_DOOR_STATUS, payload, retain=True)
+        _publish_door_state_to_app()      # [MỚI] cập nhật nút cửa trên app theo trạng thái thật
     elif event_type == "alarm":
         _publish(TOPIC_ALARM, payload)
     elif event_type == "fire_gas":
@@ -271,13 +280,12 @@ def _on_mqtt_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(TOPIC_DOOR_CMD)
     client.subscribe(TOPIC_FACE_UNLOCK)
     client.subscribe(TOPIC_FIRE_GAS_ACK)
-    for topic in TOPIC_APP_CMD_SET:  # [SỬA] subscribe từng topic cụ thể, không wildcard
+    for topic in TOPIC_APP_CMD_SET:
         client.subscribe(topic)
     client.publish(TOPIC_HOUSE_STATUS, "online", qos=1, retain=True)
 
 
 def _on_mqtt_message(client, userdata, msg):
-    # [SỬA] Chỉ xử lý đúng các topic điều khiển đã đăng ký, không bắt topic lạ
     if msg.topic in TOPIC_APP_CMD_SET:
         room, device = TOPIC_APP_CMD_SET[msg.topic]
         raw_value = msg.payload.decode("utf-8", errors="replace")
@@ -289,22 +297,22 @@ def _on_mqtt_message(client, userdata, msg):
 
     if msg.topic == TOPIC_DOOR_CMD:
         if payload in ("OPEN", "UNLOCK"):
-            living_room.unlock_door(source="app")
+            threading.Thread(target=living_room.unlock_door, kwargs={"source": "app"}, daemon=True).start()
         elif payload in ("CLOSE", "LOCK"):
-            living_room.lock_door()
+            threading.Thread(target=living_room.lock_door, daemon=True).start()
         else:
             print(f"[WARN] Lệnh cửa không hợp lệ: {payload}")
 
     elif msg.topic == TOPIC_FACE_UNLOCK:
         if payload in ("OK", "UNLOCK", "SUCCESS"):
-            living_room.unlock_door(source="face")
+            threading.Thread(target=living_room.unlock_door, kwargs={"source": "face"}, daemon=True).start()
 
     elif msg.topic == TOPIC_FIRE_GAS_ACK:
         if payload in ("ACK", "OK", "HANDLED", "CLEAR"):
             ack_fire_gas()
 
 
-# [SỬA] Tương thích paho-mqtt 1.x và 2.x, tự reconnect, có LWT
+# Tương thích paho-mqtt 1.x và 2.x, tự reconnect, có LWT
 def setup_mqtt():
     global _mqtt_client
     if not MQTT_PASSWORD:
@@ -324,18 +332,18 @@ def setup_mqtt():
     _mqtt_client.will_set(TOPIC_HOUSE_STATUS, "offline", qos=1, retain=True)
     _mqtt_client.on_connect = _on_mqtt_connect
     _mqtt_client.on_message = _on_mqtt_message
-    _mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)  # mất mạng lúc khởi động không làm crash
+    _mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
     _mqtt_client.loop_start()
 
 
-# [SỬA] Đúng thứ tự: publish offline -> disconnect -> loop_stop
+# Đúng thứ tự: publish offline -> disconnect -> loop_stop
 def cleanup_mqtt():
     global _mqtt_client
     if _mqtt_client is None:
         return
     try:
         info = _mqtt_client.publish(TOPIC_HOUSE_STATUS, "offline", qos=1, retain=True)
-        info.wait_for_publish(timeout=2)  # các publish qos1 trước đó cũng được đẩy đi theo thứ tự
+        info.wait_for_publish(timeout=2)
     except Exception:
         pass
     try:
@@ -471,7 +479,7 @@ def _set_fire_gas_alarm(context: str, level: str, unlock: bool = False):
     state["fire_gas_level"] = level
     state["fire_gas_reason"] = ",".join(_danger_reasons())
 
-    _publish_gas_alert(True)  #  báo cho app
+    _publish_gas_alert(True)
 
     print(f"[FIRE/GAS] {state['fire_gas_reason']} -> {context}/{level}: gửi lệnh về các node")
     send_command("kitchen", "ALERT_ON")
@@ -483,7 +491,12 @@ def _set_fire_gas_alarm(context: str, level: str, unlock: bool = False):
     living_room.trigger_fire_gas_alarm(level, context, _alarm_details())
 
     if unlock and not _unlock_sent:
-        living_room.unlock_door(source=f"fire_gas_{context}")
+        # [SỬA] auto_relock=False: giữ cửa mở làm lối thoát hiểm, không tự khoá lại sau vài giây
+        threading.Thread(
+            target=living_room.unlock_door,
+            kwargs={"source": f"fire_gas_{context}", "auto_relock": False},
+            daemon=True,
+        ).start()
         _unlock_sent = True
 
 
@@ -494,6 +507,11 @@ def _clear_fire_gas_alarm():
         send_command("bedroom", "ALARM_OFF", force=True)
         living_room.clear_fire_gas_alarm()
         print("[INFO] Cảnh báo gas/cháy đã về CLEAR.")
+
+        # [MỚI] Hết báo động thì khoá cửa lại (nếu lúc báo động đã mở cửa thoát hiểm
+        # và cửa đang đóng hẳn; nếu cửa còn mở thì để nguyên, người dùng tự khoá qua app)
+        if _unlock_sent and not living_room.state["door_open"]:
+            threading.Thread(target=living_room.lock_door, daemon=True).start()
 
     _publish_gas_alert(False)
 
@@ -646,7 +664,6 @@ def parse_data(line: str) -> bool:
     return False
 
 
-
 def cleanup():
     global ser, _log_fh
     try:
@@ -672,7 +689,7 @@ def cleanup():
         print("[INFO] Đã dọn dẹp phòng khách (GPIO, MQTT).")
     except Exception:
         pass
-    cleanup_mqtt()  
+    cleanup_mqtt()
 
 
 def handle_signal(signum, frame):
@@ -683,7 +700,6 @@ def handle_signal(signum, frame):
     print(f"\n[INFO] Nhận tín hiệu dừng ({signum}), đang dọn dẹp...")
     cleanup()
     sys.exit(0)
-
 
 
 def main():
@@ -711,7 +727,7 @@ def main():
 
     last_house_print = 0.0
     last_context_eval = 0.0
-    last_app_publish = 0.0  # 
+    last_app_publish = 0.0
 
     try:
         while True:
@@ -724,7 +740,6 @@ def main():
                 last_context_eval = now
                 evaluate_fire_gas_context()
 
-            #  Đẩy dữ liệu cảm biến lên app theo chu kỳ
             if now - last_app_publish >= APP_PUBLISH_INTERVAL_SEC:
                 last_app_publish = now
                 publish_sensors_to_app()
