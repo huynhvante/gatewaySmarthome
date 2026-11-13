@@ -1,5 +1,6 @@
 import serial
 import json
+import re
 import time
 import os
 import signal
@@ -23,7 +24,7 @@ LOG_PATH = "sensor_log.jsonl"
 MQTT_HOST = "749e4310b50e423c8876f553789253da.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 MQTT_USERNAME = "hvt"
-# [SỬA] Không để mật khẩu trong code. Chạy: export MQTT_PASSWORD='...'
+# Không để mật khẩu trong code. Chạy: export MQTT_PASSWORD='...'
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 MQTT_CLIENT_ID = "raspi-home-gateway"
 
@@ -40,7 +41,7 @@ TOPIC_HOUSE_STATUS = "home/gateway/status"
 ROOT_TOPIC = "smarthome"
 APP_PUBLISH_INTERVAL_SEC = 5.0
 
-# [MỚI] Trạng thái bridge (cổng serial) báo cho app
+# Trạng thái bridge (cổng serial) báo cho app
 TOPIC_BRIDGE_STATE = f"{ROOT_TOPIC}/gateway/bridge/state"   # "ONLINE" | "OFFLINE" (retained)
 TOPIC_BRIDGE_ERROR = f"{ROOT_TOPIC}/gateway/bridge/error"   # nội dung lỗi (retained), rỗng khi bình thường
 TOPIC_GATEWAY_ERROR = f"{ROOT_TOPIC}/gateway/error"         # lỗi tức thời, vd lệnh không gửi được (không retained)
@@ -56,14 +57,22 @@ CONTROLLABLE_DEVICES = [
     ("bedroom", "buzzer"),
     ("kitchen", "led"),
     ("kitchen", "fan"),
+    ("kitchen", "gas_threshold"),
 ]
 TOPIC_APP_CMD_SET = {
     f"{ROOT_TOPIC}/{room}/{device}/set": (room, device)
     for room, device in CONTROLLABLE_DEVICES
 }
 
-GAS_RAW_THRESHOLD = 2000
-GAS_VOLTAGE_FALLBACK_THRESHOLD = 2.0
+# Ngưỡng gas đặt qua app: smarthome/kitchen/gas_threshold/set, payload là số nguyên 50..3000.
+# Gateway chuyển xuống node kitchen bằng lệnh "kitchen:GAS_TH=<số>\n".
+# Giá trị đang dùng thật sự là giá trị node kitchen báo lại trong telemetry (state["kit_gas_threshold"]).
+# Khoảng này phải khớp GAS_TH_MIN / GAS_TH_MAX trong firmware kitchen.
+# Báo gas chỉ so gas_raw với ngưỡng này (không dùng điện áp).
+GAS_THRESHOLD_MIN = 50
+GAS_THRESHOLD_MAX = 3000
+_GAS_TH_RE = re.compile(r"^GAS_TH=(\d{1,4})$")
+
 TEMP_FIRE_THRESHOLD = 55.0
 TEMP_RISE_THRESHOLD = 3.0
 TEMP_RISE_WINDOW_SEC = 10.0
@@ -81,7 +90,8 @@ state = {
     "kit_temp": None,
     "kit_humid": None,
     "kit_gas_raw": None,
-    "kit_gas_voltage": None,
+    "kit_gas_voltage": None,     # chỉ để hiển thị / báo cáo, không dùng để quyết định báo động
+    "kit_gas_threshold": None,   # None cho tới khi node kitchen báo lại
     "kit_fan": False,
     "kit_led": False,
     "kit_alarm": False,
@@ -113,7 +123,7 @@ _mqtt_client = None
 _last_gas_alert = None
 _device_states = {}
 
-# [MỚI] Trạng thái bridge: None = chưa biết, True/False sau lần thử mở cổng đầu tiên
+# Trạng thái bridge: None = chưa biết, True/False sau lần thử mở cổng đầu tiên
 _bridge_online = None
 _bridge_error = ""
 
@@ -169,7 +179,7 @@ def _publish_device_state(room: str, device: str, value: str):
     _publish_raw(f"{ROOT_TOPIC}/{room}/{device}/state", value, qos=1, retain=True)
 
 
-# [MỚI] Đồng bộ trạng thái khoá cửa THẬT lên app (khoá tự lại sau vài giây, app cần biết)
+# Đồng bộ trạng thái khoá cửa THẬT lên app (khoá tự lại sau vài giây, app cần biết)
 def _publish_door_state_to_app():
     lr = living_room.state
     value = "OFF" if lr.get("door_locked") else "ON"   # quy ước: ON = mở khoá, OFF = đã khoá
@@ -177,6 +187,18 @@ def _publish_door_state_to_app():
         return
     _device_states[("living_room", "door")] = value
     _publish_device_state("living_room", "door", value)
+
+
+# Đồng bộ ngưỡng gas THẬT (do node kitchen báo lại) lên app
+def _publish_gas_threshold_state_to_app():
+    th = state.get("kit_gas_threshold")
+    if th is None:
+        return
+    value = str(th)
+    if _device_states.get(("kitchen", "gas_threshold")) == value:
+        return
+    _device_states[("kitchen", "gas_threshold")] = value
+    _publish_device_state("kitchen", "gas_threshold", value)
 
 
 # Gửi toàn bộ cảm biến theo đúng cấu trúc topic của app
@@ -187,9 +209,9 @@ def publish_sensors_to_app():
     _pub_sensor("living_room", "pir", "motion", lr.get("motion"))
     _pub_sensor("living_room", "dht", "temperature", lr.get("temp"))
     _pub_sensor("living_room", "dht", "humidity", lr.get("humid"))
-    _pub_sensor("living_room", "reed", "open", lr.get("door_open"))   # [MỚI] cửa đang mở/đóng
+    _pub_sensor("living_room", "reed", "open", lr.get("door_open"))
 
-    # [MỚI] Bếp/phòng ngủ lấy qua bridge: mất bridge thì KHÔNG publish giá trị cũ như thể còn mới
+    # Bếp/phòng ngủ lấy qua bridge: mất bridge thì KHÔNG publish giá trị cũ như thể còn mới
     if not _bridge_online:
         return
 
@@ -230,7 +252,7 @@ def _normalize_switch_payload(raw: str):
     return None
 
 
-# [SỬA] Trả về chuỗi trạng thái thay vì True/False:
+# Trả về chuỗi trạng thái thay vì True/False:
 #   "ok"          = đã gửi lệnh tới phần cứng
 #   "failed"      = có phần cứng nhưng không gửi được (bridge không kết nối)
 #   "unsupported" = chưa nối phần cứng thật
@@ -255,8 +277,39 @@ def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> str:
     return "unsupported"
 
 
+# Nhận ngưỡng gas từ app và chuyển xuống node kitchen qua bridge
+def _handle_gas_threshold_command(raw_value: str):
+    try:
+        th = int(float(raw_value.strip()))
+    except (ValueError, OverflowError):   # OverflowError: payload như "inf" hoặc "1e999"
+        _notify_gateway_error(
+            f"Ngưỡng gas không hợp lệ: '{raw_value}' (cần số nguyên "
+            f"{GAS_THRESHOLD_MIN}..{GAS_THRESHOLD_MAX})."
+        )
+        return
+
+    if not GAS_THRESHOLD_MIN <= th <= GAS_THRESHOLD_MAX:
+        _notify_gateway_error(
+            f"Ngưỡng gas {th} ngoài khoảng {GAS_THRESHOLD_MIN}..{GAS_THRESHOLD_MAX}."
+        )
+        return
+
+    if not send_command("kitchen", f"GAS_TH={th}", force=True):
+        _notify_gateway_error(f"Không gửi được ngưỡng gas {th}: bridge chưa kết nối.")
+        return
+
+    # KHÔNG publish state ở đây: chờ node kitchen báo lại trong telemetry (xem parse_data),
+    # để app luôn thấy giá trị node thật sự đang dùng.
+    print(f"[CMD] Đã gửi ngưỡng gas {th} xuống kitchen, chờ node xác nhận.")
+
+
 # Xử lý lệnh app publish vào smarthome/<room>/<device>/set
 def _handle_app_command(room: str, device: str, raw_value: str):
+    # Ngưỡng gas là số, không phải ON/OFF nên xử lý riêng
+    if (room, device) == ("kitchen", "gas_threshold"):
+        _handle_gas_threshold_command(raw_value)
+        return
+
     value = _normalize_switch_payload(raw_value)
     if value is None:
         print(f"[WARN] Giá trị lệnh không hợp lệ: {ROOT_TOPIC}/{room}/{device}/set = {raw_value}")
@@ -264,7 +317,7 @@ def _handle_app_command(room: str, device: str, raw_value: str):
 
     result = _dispatch_hardware_command(room, device, value == "ON")
 
-    # [MỚI] Lệnh không tới được phần cứng: báo lỗi cho app, KHÔNG xác nhận trạng thái giả
+    # Lệnh không tới được phần cứng: báo lỗi cho app, KHÔNG xác nhận trạng thái giả
     if result == "failed":
         _notify_gateway_error(
             f"Không gửi được lệnh {room}/{device} = {value}: bridge chưa kết nối."
@@ -283,7 +336,7 @@ def _handle_app_command(room: str, device: str, raw_value: str):
 def _on_living_room_event(event_type: str, payload: dict):
     if event_type == "door_status":
         _publish(TOPIC_DOOR_STATUS, payload, retain=True)
-        _publish_door_state_to_app()      # [MỚI] cập nhật nút cửa trên app theo trạng thái thật
+        _publish_door_state_to_app()      # cập nhật nút cửa trên app theo trạng thái thật
     elif event_type == "alarm":
         _publish(TOPIC_ALARM, payload)
     elif event_type == "fire_gas":
@@ -300,7 +353,7 @@ def _on_mqtt_connect(client, userdata, flags, rc, properties=None):
     for topic in TOPIC_APP_CMD_SET:
         client.subscribe(topic)
     client.publish(TOPIC_HOUSE_STATUS, "online", qos=1, retain=True)
-    _publish_bridge_state()   # [MỚI] bridge có thể đã lỗi từ trước khi MQTT kết nối xong
+    _publish_bridge_state()   # bridge có thể đã lỗi từ trước khi MQTT kết nối xong
 
 
 def _on_mqtt_message(client, userdata, msg):
@@ -374,7 +427,7 @@ def cleanup_mqtt():
 
 
 # ==========================================
-# [MỚI] BRIDGE (CỔNG SERIAL): MỞ / MẤT KẾT NỐI / BÁO LỖI CHO APP
+# BRIDGE (CỔNG SERIAL): MỞ / MẤT KẾT NỐI / BÁO LỖI CHO APP
 # ==========================================
 def _notify_gateway_error(message: str):
     """Báo lỗi tức thời cho app (không retained: chỉ app đang mở mới nhận)."""
@@ -454,7 +507,15 @@ def send_command(target: str, cmd: str, force: bool = False) -> bool:
     target = target.strip().lower()
     cmd = cmd.strip().upper()
 
-    if target not in allowed_targets or cmd not in allowed_cmds:
+    # Lệnh đặt ngưỡng gas: GAS_TH=<GAS_THRESHOLD_MIN..GAS_THRESHOLD_MAX>, chỉ dành cho kitchen
+    gas_match = _GAS_TH_RE.match(cmd)
+    valid_gas_cmd = bool(
+        gas_match
+        and target == "kitchen"
+        and GAS_THRESHOLD_MIN <= int(gas_match.group(1)) <= GAS_THRESHOLD_MAX
+    )
+
+    if target not in allowed_targets or not (cmd in allowed_cmds or valid_gas_cmd):
         print(f"[WARN] Lệnh không hợp lệ: {target}:{cmd}")
         return False
 
@@ -504,12 +565,11 @@ def _kitchen_temp_delta():
         return 0.0
     return _kit_temp_history[-1][1] - _kit_temp_history[0][1]
 
-
 def _is_night():
     hour = datetime.now().hour
     return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
 
-
+## Cập nhật thời điểm cuối cùng có người hiện diện trong nhà (motion PIR hoặc YOLO)
 def _update_presence():
     global _last_presence_ts
     lr = living_room.state
@@ -533,18 +593,20 @@ def _danger_detected():
     return bool(_danger_reasons())
 
 
+# Hàm trả về danh sách lý do cảnh báo gas/cháy, để app hiển thị cho người dùng
 def _danger_reasons():
+    gas_threshold = state.get("kit_gas_threshold")
     gas_raw = state["kit_gas_raw"]
-    gas_voltage = state["kit_gas_voltage"]
     temp = state["kit_temp"]
     temp_delta = _kitchen_temp_delta()
 
     reasons = []
-    if (
-        (gas_raw is not None and gas_raw >= GAS_RAW_THRESHOLD) or
-        (gas_raw is None and gas_voltage is not None and gas_voltage >= GAS_VOLTAGE_FALLBACK_THRESHOLD)
-    ):
+
+    # Báo gas chỉ so gas_raw với ngưỡng node kitchen đang dùng.
+    # Chưa biết ngưỡng (node chưa báo) thì không so sánh với None.
+    if gas_raw is not None and gas_threshold is not None and gas_raw >= gas_threshold:
         reasons.append("gas")
+
     if temp is not None and temp >= TEMP_FIRE_THRESHOLD:
         reasons.append("high_temp")
     if temp_delta >= TEMP_RISE_THRESHOLD:
@@ -558,6 +620,7 @@ def _alarm_details():
         "kit_humid": state["kit_humid"],
         "kit_gas_raw": state["kit_gas_raw"],
         "kit_gas_voltage": state["kit_gas_voltage"],
+        "kit_gas_threshold": state["kit_gas_threshold"],
         "delta_t_10s": round(_kitchen_temp_delta(), 2),
         "reason": state["fire_gas_reason"],
         "bed_motion": state["bed_motion"],
@@ -584,7 +647,7 @@ def _set_fire_gas_alarm(context: str, level: str, unlock: bool = False):
     living_room.trigger_fire_gas_alarm(level, context, _alarm_details())
 
     if unlock and not _unlock_sent:
-        # [SỬA] auto_relock=False: giữ cửa mở làm lối thoát hiểm, không tự khoá lại sau vài giây
+        # auto_relock=False: giữ cửa mở làm lối thoát hiểm, không tự khoá lại sau vài giây
         threading.Thread(
             target=living_room.unlock_door,
             kwargs={"source": f"fire_gas_{context}", "auto_relock": False},
@@ -601,7 +664,7 @@ def _clear_fire_gas_alarm():
         living_room.clear_fire_gas_alarm()
         print("[INFO] Cảnh báo gas/cháy đã về CLEAR.")
 
-        # [MỚI] Hết báo động thì khoá cửa lại (nếu lúc báo động đã mở cửa thoát hiểm
+        # Hết báo động thì khoá cửa lại (nếu lúc báo động đã mở cửa thoát hiểm
         # và cửa đang đóng hẳn; nếu cửa còn mở thì để nguyên, người dùng tự khoá qua app)
         if _unlock_sent and not living_room.state["door_open"]:
             threading.Thread(target=living_room.lock_door, daemon=True).start()
@@ -619,7 +682,7 @@ def _clear_fire_gas_alarm():
 def evaluate_fire_gas_context():
     global _danger_started_ts, _day_escalated
 
-    # [MỚI] Chưa có bridge thì không có dữ liệu bếp/phòng ngủ để đánh giá. Nếu đang KHÔNG báo động
+    # Chưa có bridge thì không có dữ liệu bếp/phòng ngủ để đánh giá. Nếu đang KHÔNG báo động
     # thì bỏ qua (tránh báo "gas an toàn" giả lên app). Nếu ĐANG báo động thì vẫn đánh giá tiếp
     # để giữ nguyên báo động (an toàn hơn là tự tắt khi không còn dữ liệu).
     if not _bridge_online and state["fire_gas_level"] == "CLEAR":
@@ -690,19 +753,29 @@ def parse_data(line: str) -> bool:
         kit_temp = data.get("temp")
         kit_humid = data.get("humid")
         kit_gas_raw = data.get("gas_raw")
-        kit_gas_voltage = data.get("gas_voltage", data.get("gas"))
+        kit_gas_voltage = data.get("gas_voltage", data.get("gas"))   # tuỳ chọn, chỉ để hiển thị
 
-        if None in (kit_temp, kit_humid) or (kit_gas_raw is None and kit_gas_voltage is None):
+        # gas_raw là bắt buộc: báo gas chỉ dựa vào nó. Thiếu thì bỏ gói và cảnh báo rõ ràng.
+        if None in (kit_temp, kit_humid, kit_gas_raw):
             print(f"[WARN] Kitchen thiếu field: {data}")
             return False
 
         state["kit_temp"] = round(float(kit_temp), 1)
         state["kit_humid"] = round(float(kit_humid), 1)
-        state["kit_gas_raw"] = int(kit_gas_raw) if kit_gas_raw is not None else None
+        state["kit_gas_raw"] = int(kit_gas_raw)
         state["kit_gas_voltage"] = round(float(kit_gas_voltage), 3) if kit_gas_voltage is not None else None
         state["kit_fan"] = bool(data.get("fan", False))
         state["kit_led"] = bool(data.get("led", False))
         state["kit_alarm"] = bool(data.get("alarm", False))
+
+        # Ngưỡng là field tuỳ chọn: firmware cũ chưa gửi thì giữ giá trị trước đó, không crash
+        th_raw = data.get("gas_threshold")
+        if th_raw is not None:
+            try:
+                state["kit_gas_threshold"] = int(th_raw)
+                _publish_gas_threshold_state_to_app()   # app thấy đúng giá trị node đang dùng
+            except (TypeError, ValueError):
+                print(f"[WARN] Kitchen gas_threshold không hợp lệ: {th_raw!r}")
 
         _remember_kitchen_temp(state["kit_temp"])
         _update_presence()
@@ -711,13 +784,14 @@ def parse_data(line: str) -> bool:
               f"Nhiệt độ: {state['kit_temp']}°C  "
               f"Độ ẩm: {state['kit_humid']}%  "
               f"Gas: raw={state['kit_gas_raw']} / {state['kit_gas_voltage']}V  "
-              )
+              f"Ngưỡng: {state['kit_gas_threshold']}")
 
         safe_append_log({"ts": ts, "node": "kitchen", **{
             "temp": state["kit_temp"],
             "humid": state["kit_humid"],
             "gas_raw": state["kit_gas_raw"],
             "gas_voltage": state["kit_gas_voltage"],
+            "gas_threshold": state["kit_gas_threshold"],
         }})
         evaluate_fire_gas_context()
         return True
@@ -813,7 +887,7 @@ def main():
     _living_room_thread = threading.Thread(target=living_room.run, daemon=True)
     _living_room_thread.start()
 
-    # [SỬA] Bridge có thể chưa cắm: thử mở 1 lần. Lỗi thì gateway VẪN CHẠY (phòng khách, MQTT, app)
+    # Bridge có thể chưa cắm: thử mở 1 lần. Lỗi thì gateway VẪN CHẠY (phòng khách, MQTT, app)
     # và cứ BRIDGE_RETRY_SEC giây tự thử lại, nên cắm bridge vào sau cũng được.
     print(f"Đang kết nối bridge {PORT} @ {BAUD_RATE} baud ...")
     if not _open_serial():
@@ -864,6 +938,7 @@ def main():
                       f"Bridge: {bridge_txt}  "
                       f"Kitchen: {state['kit_temp']}°C/{state['kit_humid']}%/"
                       f"gas={state['kit_gas_raw']}  "
+                      f"Ngưỡng: {state.get('kit_gas_threshold')}  "
                       f"Bedroom: {state['bed_temp']}°C/{state['bed_humid']}%  "
                       f"Living room: {lr['temp']}°C/{lr['humid']}%  "
                       f"Người: {'Có' if _update_presence() else 'Không'}  "
