@@ -11,6 +11,7 @@ from datetime import datetime
 import paho.mqtt.client as mqtt
 
 import living_room
+from firebase_bridge import FirebaseBridge
 
 # ==========================================
 # CẤU HÌNH
@@ -27,6 +28,12 @@ MQTT_USERNAME = "hvt"
 # Không để mật khẩu trong code. Chạy: export MQTT_PASSWORD='...'
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 MQTT_CLIENT_ID = "raspi-home-gateway"
+
+# --- Firebase (Firestore) ---
+# File khoá đọc từ biến môi trường FIREBASE_KEY_PATH (mặc định: serviceAccountKey.json cạnh gateway.py)
+FIREBASE_GATEWAY_ID = MQTT_CLIENT_ID
+FIREBASE_STATE_INTERVAL_SEC = 15.0      # chu kỳ ghi state/<gateway_id>
+FIREBASE_FCM_TOPIC = None               # đặt "alerts" nếu app Android đã subscribe topic FCM
 
 # --- Topic điều khiển / trạng thái nội bộ (giữ nguyên) ---
 TOPIC_DOOR_CMD = "home/livingroom/door/cmd"
@@ -45,7 +52,7 @@ APP_PUBLISH_INTERVAL_SEC = 5.0
 TOPIC_BRIDGE_STATE = f"{ROOT_TOPIC}/gateway/bridge/state"   # "ONLINE" | "OFFLINE" (retained)
 TOPIC_BRIDGE_ERROR = f"{ROOT_TOPIC}/gateway/bridge/error"   # nội dung lỗi (retained), rỗng khi bình thường
 TOPIC_GATEWAY_ERROR = f"{ROOT_TOPIC}/gateway/error"         # lỗi tức thời, vd lệnh không gửi được (không retained)
-BRIDGE_RETRY_SEC = 5.0                                      # chu kỳ tự thử mở lại cổng serial
+BRIDGE_RETRY_SEC = 5.0                                       # chu kỳ tự thử mở lại cổng serial
 _BRIDGE_IMPACT = "Dữ liệu bếp/phòng ngủ và cảnh báo gas/cháy của 2 phòng này tạm thời không hoạt động."
 
 CONTROLLABLE_DEVICES = [
@@ -83,6 +90,12 @@ NIGHT_UNLOCK_AFTER_SEC = 30
 DAY_ESCALATE_AFTER_SEC = 60
 COMMAND_REPEAT_SEC = 10
 
+# Hết nguy hiểm phải liên tục bấy lâu mới tắt báo động (tránh còi kêu/tắt nhấp nháy khi gas dao động quanh ngưỡng)
+CLEAR_HOLD_SEC = 10
+# Số lần gửi lệnh tắt còi (ESP-NOW không có xác nhận, gửi lặp để tránh mất gói)
+ALARM_OFF_REPEAT = 3
+ALARM_OFF_REPEAT_GAP_SEC = 0.3
+
 # ==========================================
 # TRẠNG THÁI TOÀN CỤC
 # ==========================================
@@ -114,6 +127,7 @@ _shutdown = False
 _living_room_thread = None
 _kit_temp_history = []
 _danger_started_ts = None
+_safe_since = None         # thời điểm bắt đầu hết nguy hiểm (để giữ báo động thêm CLEAR_HOLD_SEC)
 _day_escalated = False
 _unlock_sent = False
 _manual_ack_ts = 0.0
@@ -122,6 +136,7 @@ _last_command = {}
 _mqtt_client = None
 _last_gas_alert = None
 _device_states = {}
+_last_fb_alarm = None      # (context, level) đã ghi lên Firebase, tránh ghi lặp mỗi giây
 
 # Trạng thái bridge: None = chưa biết, True/False sau lần thử mở cổng đầu tiên
 _bridge_online = None
@@ -277,52 +292,53 @@ def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> str:
     return "unsupported"
 
 
-# Nhận ngưỡng gas từ app và chuyển xuống node kitchen qua bridge
+# Nhận ngưỡng gas từ app và chuyển xuống node kitchen qua bridge.
+# Trả về (ok, message): MQTT bỏ qua giá trị trả về, Firestore dùng để ghi status done/failed.
 def _handle_gas_threshold_command(raw_value: str):
     try:
         th = int(float(raw_value.strip()))
     except (ValueError, OverflowError):   # OverflowError: payload như "inf" hoặc "1e999"
-        _notify_gateway_error(
-            f"Ngưỡng gas không hợp lệ: '{raw_value}' (cần số nguyên "
-            f"{GAS_THRESHOLD_MIN}..{GAS_THRESHOLD_MAX})."
-        )
-        return
+        msg = (f"Ngưỡng gas không hợp lệ: '{raw_value}' (cần số nguyên "
+               f"{GAS_THRESHOLD_MIN}..{GAS_THRESHOLD_MAX}).")
+        _notify_gateway_error(msg)
+        return False, msg
 
     if not GAS_THRESHOLD_MIN <= th <= GAS_THRESHOLD_MAX:
-        _notify_gateway_error(
-            f"Ngưỡng gas {th} ngoài khoảng {GAS_THRESHOLD_MIN}..{GAS_THRESHOLD_MAX}."
-        )
-        return
+        msg = f"Ngưỡng gas {th} ngoài khoảng {GAS_THRESHOLD_MIN}..{GAS_THRESHOLD_MAX}."
+        _notify_gateway_error(msg)
+        return False, msg
 
     if not send_command("kitchen", f"GAS_TH={th}", force=True):
-        _notify_gateway_error(f"Không gửi được ngưỡng gas {th}: bridge chưa kết nối.")
-        return
+        msg = f"Không gửi được ngưỡng gas {th}: bridge chưa kết nối."
+        _notify_gateway_error(msg)
+        return False, msg
 
     # KHÔNG publish state ở đây: chờ node kitchen báo lại trong telemetry (xem parse_data),
     # để app luôn thấy giá trị node thật sự đang dùng.
     print(f"[CMD] Đã gửi ngưỡng gas {th} xuống kitchen, chờ node xác nhận.")
+    return True, f"Đã gửi ngưỡng gas {th}, chờ node xác nhận."
 
 
-# Xử lý lệnh app publish vào smarthome/<room>/<device>/set
+# Xử lý lệnh app publish vào smarthome/<room>/<device>/set (hoặc lệnh từ Firestore).
+# Trả về (ok, message).
 def _handle_app_command(room: str, device: str, raw_value: str):
     # Ngưỡng gas là số, không phải ON/OFF nên xử lý riêng
     if (room, device) == ("kitchen", "gas_threshold"):
-        _handle_gas_threshold_command(raw_value)
-        return
+        return _handle_gas_threshold_command(raw_value)
 
     value = _normalize_switch_payload(raw_value)
     if value is None:
-        print(f"[WARN] Giá trị lệnh không hợp lệ: {ROOT_TOPIC}/{room}/{device}/set = {raw_value}")
-        return
+        msg = f"Giá trị lệnh không hợp lệ: {room}/{device} = {raw_value}"
+        print(f"[WARN] {msg}")
+        return False, msg
 
     result = _dispatch_hardware_command(room, device, value == "ON")
 
     # Lệnh không tới được phần cứng: báo lỗi cho app, KHÔNG xác nhận trạng thái giả
     if result == "failed":
-        _notify_gateway_error(
-            f"Không gửi được lệnh {room}/{device} = {value}: bridge chưa kết nối."
-        )
-        return
+        msg = f"Không gửi được lệnh {room}/{device} = {value}: bridge chưa kết nối."
+        _notify_gateway_error(msg)
+        return False, msg
 
     _device_states[(room, device)] = value
     _publish_device_state(room, device, value)
@@ -331,18 +347,107 @@ def _handle_app_command(room: str, device: str, raw_value: str):
           f"đã cập nhật {ROOT_TOPIC}/{room}/{device}/state")
     if result == "unsupported":
         print(f"    (lưu ý: {room}/{device} chưa nối phần cứng thật, chỉ echo trạng thái cho app)")
+        return True, "Chưa nối phần cứng thật, chỉ cập nhật trạng thái"
+    return True, "ok"
+
+
+# ==========================================
+# FIREBASE (FIRESTORE)
+# ==========================================
+# Lệnh từ collection "commands": chỉ chấp nhận đúng các thiết bị điều khiển được
+def _firebase_command_handler(room: str, device: str, value: str):
+    if (room, device) not in CONTROLLABLE_DEVICES:
+        return False, f"Thiết bị không được hỗ trợ: {room}/{device}"
+    return _handle_app_command(room, device, value)
+
+
+# Ảnh chụp trạng thái toàn nhà để ghi vào state/<gateway_id>
+def _firebase_state_snapshot() -> dict:
+    lr = living_room.state
+    return {
+        "kitchen": {
+            "temp": state["kit_temp"],
+            "humid": state["kit_humid"],
+            "gas_raw": state["kit_gas_raw"],
+            "gas_voltage": state["kit_gas_voltage"],
+            "gas_threshold": state["kit_gas_threshold"],
+            "fan": state["kit_fan"],
+            "led": state["kit_led"],
+            "alarm": state["kit_alarm"],
+        },
+        "bedroom": {
+            "temp": state["bed_temp"],
+            "humid": state["bed_humid"],
+            "light": state["bed_light"],
+            "motion": state["bed_motion"],
+            "fan": state["bed_fan"],
+            "led": state["bed_led"],
+            "alarm_level": state["bed_alarm_level"],
+        },
+        "living_room": {
+            "temp": lr.get("temp"),
+            "humid": lr.get("humid"),
+            "motion": lr.get("motion"),
+            "door_open": lr.get("door_open"),
+            "door_locked": lr.get("door_locked"),
+            "yolo_people_count": int(lr.get("yolo_people_count") or 0),
+        },
+        "fire_gas": {
+            "level": state["fire_gas_level"],
+            "context": state["fire_gas_context"],
+            "reason": state["fire_gas_reason"],
+        },
+        "bridge": {"online": bool(_bridge_online), "error": _bridge_error},
+        "devices": {f"{r}_{d}": v for (r, d), v in _device_states.items()},
+    }
+
+
+fb = FirebaseBridge(
+    gateway_id=FIREBASE_GATEWAY_ID,
+    command_handler=_firebase_command_handler,
+    fcm_topic=FIREBASE_FCM_TOPIC,
+)
+
+_LEVEL_TITLE = {
+    "MED": "Cảnh báo gas/cháy",
+    "MAX": "NGUY HIỂM: gas/cháy",
+    "RED": "KHẨN CẤP: gas/cháy",
+}
+
+
+# Ghi sự kiện + thông báo khi báo động gas/cháy đổi (context, level)
+def _notify_fire_gas_firebase(context: str, level: str):
+    severity = "critical" if level in ("MAX", "RED") else "warning"
+    payload = {**_alarm_details(), "level": level, "context": context}
+    fb.add_event("fire_gas", payload, level=severity)
+    fb.add_notification(
+        _LEVEL_TITLE.get(level, "Cảnh báo gas/cháy"),
+        f"Nguyên nhân: {state['fire_gas_reason']} (tình huống: {context})",
+        level=severity,
+        event_type="fire_gas",
+    )
 
 
 def _on_living_room_event(event_type: str, payload: dict):
     if event_type == "door_status":
         _publish(TOPIC_DOOR_STATUS, payload, retain=True)
         _publish_door_state_to_app()      # cập nhật nút cửa trên app theo trạng thái thật
+        fb.add_event("door_status", payload)
     elif event_type == "alarm":
         _publish(TOPIC_ALARM, payload)
+        fb.add_event("alarm", payload, level="warning")
     elif event_type == "fire_gas":
         _publish(TOPIC_FIRE_GAS, payload, retain=True)
+        # Sự kiện fire_gas cho Firebase đã được ghi ở _set_fire_gas_alarm (chỉ khi đổi mức)
     elif event_type == "sensor_reading":
         safe_append_log({"ts": datetime.now().strftime("%H:%M:%S"), "node": "living_room", **payload})
+    elif event_type == "device_state":
+        # Nút nhấn vật lý đổi trạng thái đèn/quạt phòng khách: đồng bộ lên app
+        dev = payload.get("device")
+        if dev in ("led", "fan"):
+            value = "ON" if payload.get("on") else "OFF"
+            _device_states[("living_room", dev)] = value
+            _publish_device_state("living_room", dev, value)
 
 
 def _on_mqtt_connect(client, userdata, flags, rc, properties=None):
@@ -456,6 +561,14 @@ def _set_bridge_state(online: bool, reason: str = ""):
     else:
         print(f"[BRIDGE][ERROR] {reason}")
     _publish_bridge_state()
+
+    # Firebase: cập nhật gateways/<id>, ghi sự kiện, và thông báo khi mất bridge
+    fb.update_gateway(bridge_online=online, bridge_error=reason)
+    if online:
+        fb.add_event("bridge_online", {"port": PORT})
+    else:
+        fb.add_event("bridge_offline", {"reason": reason}, level="warning")
+        fb.add_notification("Mất kết nối bridge", reason, level="warning", event_type="bridge_offline")
 
 
 def _open_serial() -> bool:
@@ -630,20 +743,24 @@ def _alarm_details():
 
 
 def _set_fire_gas_alarm(context: str, level: str, unlock: bool = False):
-    global _unlock_sent
+    global _unlock_sent, _last_fb_alarm
     state["fire_gas_context"] = context
     state["fire_gas_level"] = level
     state["fire_gas_reason"] = ",".join(_danger_reasons())
 
     _publish_gas_alert(True)
 
+    # Firebase: chỉ ghi khi đổi (context, level), không ghi lặp mỗi giây
+    if (context, level) != _last_fb_alarm:
+        _last_fb_alarm = (context, level)
+        _notify_fire_gas_firebase(context, level)
+
     print(f"[FIRE/GAS] {state['fire_gas_reason']} -> {context}/{level}: gửi lệnh về các node")
     send_command("kitchen", "ALERT_ON")
-    if level == "MED":
-        send_command("bedroom", "ALARM_MED")
-    else:
-        send_command("bedroom", "ALARM_MAX")
+    # Còi phòng ngủ luôn kêu mạnh nhất khi có báo động, bất kể mức MED/MAX/RED
+    send_command("bedroom", "ALARM_MAX")
 
+    # Phòng khách: bật đèn/quạt (không dùng còi)
     living_room.trigger_fire_gas_alarm(level, context, _alarm_details())
 
     if unlock and not _unlock_sent:
@@ -656,13 +773,36 @@ def _set_fire_gas_alarm(context: str, level: str, unlock: bool = False):
         _unlock_sent = True
 
 
+def _send_alarm_off_repeated():
+    """Gửi lệnh tắt còi: lần đầu ngay lập tức, các lần sau trong thread riêng
+    (ESP-NOW không có xác nhận nên gửi lặp để tránh mất gói, còi không kêu mãi)."""
+    send_command("kitchen", "ALERT_OFF", force=True)
+    send_command("bedroom", "ALARM_OFF", force=True)
+
+    def _worker():
+        for _ in range(ALARM_OFF_REPEAT - 1):
+            time.sleep(ALARM_OFF_REPEAT_GAP_SEC)
+            send_command("kitchen", "ALERT_OFF", force=True)
+            send_command("bedroom", "ALARM_OFF", force=True)
+
+    if ALARM_OFF_REPEAT > 1:
+        threading.Thread(target=_worker, daemon=True).start()
+
+
 def _clear_fire_gas_alarm():
-    global _danger_started_ts, _day_escalated, _unlock_sent
+    global _danger_started_ts, _day_escalated, _unlock_sent, _last_fb_alarm, _safe_since
     if state["fire_gas_level"] != "CLEAR":
-        send_command("kitchen", "ALERT_OFF", force=True)
-        send_command("bedroom", "ALARM_OFF", force=True)
+        _send_alarm_off_repeated()
         living_room.clear_fire_gas_alarm()
         print("[INFO] Cảnh báo gas/cháy đã về CLEAR.")
+
+        fb.add_event("fire_gas_clear", {"previous_level": state["fire_gas_level"]})
+        fb.add_notification(
+            "Đã hết cảnh báo gas/cháy",
+            "Trạng thái trở về bình thường.",
+            level="info",
+            event_type="fire_gas_clear",
+        )
 
         # Hết báo động thì khoá cửa lại (nếu lúc báo động đã mở cửa thoát hiểm
         # và cửa đang đóng hẳn; nếu cửa còn mở thì để nguyên, người dùng tự khoá qua app)
@@ -675,12 +815,14 @@ def _clear_fire_gas_alarm():
     state["fire_gas_level"] = "CLEAR"
     state["fire_gas_reason"] = "none"
     _danger_started_ts = None
+    _safe_since = None
     _day_escalated = False
     _unlock_sent = False
+    _last_fb_alarm = None
 
 
 def evaluate_fire_gas_context():
-    global _danger_started_ts, _day_escalated
+    global _danger_started_ts, _day_escalated, _safe_since
 
     # Chưa có bridge thì không có dữ liệu bếp/phòng ngủ để đánh giá. Nếu đang KHÔNG báo động
     # thì bỏ qua (tránh báo "gas an toàn" giả lên app). Nếu ĐANG báo động thì vẫn đánh giá tiếp
@@ -690,8 +832,17 @@ def evaluate_fire_gas_context():
 
     now = time.time()
     if not _danger_detected():
+        if state["fire_gas_level"] != "CLEAR":
+            # Đang báo động: phải hết nguy hiểm liên tục CLEAR_HOLD_SEC mới tắt
+            if _safe_since is None:
+                _safe_since = now
+            if now - _safe_since < CLEAR_HOLD_SEC:
+                return
+        _safe_since = None
         _clear_fire_gas_alarm()
         return
+
+    _safe_since = None   # nguy hiểm quay lại: huỷ bộ đếm giữ báo động
 
     if _manual_ack_ts and _danger_started_ts and _manual_ack_ts >= _danger_started_ts:
         _set_fire_gas_alarm("acknowledged", "MED")
@@ -755,13 +906,19 @@ def parse_data(line: str) -> bool:
         kit_gas_raw = data.get("gas_raw")
         kit_gas_voltage = data.get("gas_voltage", data.get("gas"))   # tuỳ chọn, chỉ để hiển thị
 
-        # gas_raw là bắt buộc: báo gas chỉ dựa vào nó. Thiếu thì bỏ gói và cảnh báo rõ ràng.
-        if None in (kit_temp, kit_humid, kit_gas_raw):
-            print(f"[WARN] Kitchen thiếu field: {data}")
+        # Chỉ gas_raw là bắt buộc: báo gas chỉ dựa vào nó.
+        # DHT (temp/humid) lỗi thì KHÔNG được làm mất cảnh báo gas.
+        if kit_gas_raw is None:
+            print(f"[WARN] Kitchen thiếu gas_raw: {data}")
             return False
 
-        state["kit_temp"] = round(float(kit_temp), 1)
-        state["kit_humid"] = round(float(kit_humid), 1)
+        if kit_temp is None or kit_humid is None:
+            print("[WARN] Kitchen DHT đọc lỗi tạm thời, giữ nguyên nhiệt độ/độ ẩm trước đó.")
+        else:
+            state["kit_temp"] = round(float(kit_temp), 1)
+            state["kit_humid"] = round(float(kit_humid), 1)
+            _remember_kitchen_temp(state["kit_temp"])
+
         state["kit_gas_raw"] = int(kit_gas_raw)
         state["kit_gas_voltage"] = round(float(kit_gas_voltage), 3) if kit_gas_voltage is not None else None
         state["kit_fan"] = bool(data.get("fan", False))
@@ -777,7 +934,6 @@ def parse_data(line: str) -> bool:
             except (TypeError, ValueError):
                 print(f"[WARN] Kitchen gas_threshold không hợp lệ: {th_raw!r}")
 
-        _remember_kitchen_temp(state["kit_temp"])
         _update_presence()
 
         print(f"[{ts}] KITCHEN | "
@@ -862,6 +1018,10 @@ def cleanup():
         print("[INFO] Đã dọn dẹp phòng khách (GPIO, MQTT).")
     except Exception:
         pass
+    try:
+        fb.stop()       # đánh dấu gateway offline và xả hàng đợi ghi Firestore
+    except Exception:
+        pass
     cleanup_mqtt()
 
 
@@ -883,6 +1043,7 @@ def main():
 
     living_room.set_event_callback(_on_living_room_event)
     setup_mqtt()
+    fb.start()   # lỗi (thiếu thư viện / khoá / mạng) chỉ cảnh báo, gateway vẫn chạy
 
     _living_room_thread = threading.Thread(target=living_room.run, daemon=True)
     _living_room_thread.start()
@@ -899,6 +1060,7 @@ def main():
     last_house_print = 0.0
     last_context_eval = 0.0
     last_app_publish = 0.0
+    last_fb_state = 0.0
 
     try:
         while True:
@@ -928,6 +1090,10 @@ def main():
             if now - last_app_publish >= APP_PUBLISH_INTERVAL_SEC:
                 last_app_publish = now
                 publish_sensors_to_app()
+
+            if now - last_fb_state >= FIREBASE_STATE_INTERVAL_SEC:
+                last_fb_state = now
+                fb.publish_state(_firebase_state_snapshot())
 
             if now - last_house_print >= 5.0:
                 last_house_print = now
