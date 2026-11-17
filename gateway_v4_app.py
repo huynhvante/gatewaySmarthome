@@ -96,6 +96,9 @@ CLEAR_HOLD_SEC = 10
 ALARM_OFF_REPEAT = 3
 ALARM_OFF_REPEAT_GAP_SEC = 0.3
 
+# Sau khi app gửi lệnh đèn/quạt, bỏ qua telemetry cũ chừng này giây (chờ node cập nhật xong)
+DEVICE_SYNC_GRACE_SEC = 4.0
+
 # ==========================================
 # TRẠNG THÁI TOÀN CỤC
 # ==========================================
@@ -136,7 +139,9 @@ _last_command = {}
 _mqtt_client = None
 _last_gas_alert = None
 _device_states = {}
+_device_cmd_ts = {}        # (room, device) -> thời điểm app gửi lệnh gần nhất
 _last_fb_alarm = None      # (context, level) đã ghi lên Firebase, tránh ghi lặp mỗi giây
+_last_lr_alarm_key = {}    # event_type -> (level, context) đã phát từ phòng khách, tránh phát lặp mỗi giây
 
 # Trạng thái bridge: None = chưa biết, True/False sau lần thử mở cổng đầu tiên
 _bridge_online = None
@@ -214,6 +219,39 @@ def _publish_gas_threshold_state_to_app():
         return
     _device_states[("kitchen", "gas_threshold")] = value
     _publish_device_state("kitchen", "gas_threshold", value)
+
+
+# Đồng bộ trạng thái THẬT của đèn/quạt (từ node/phòng khách) lên app, chỉ publish khi đổi.
+# Bắt được mọi nguồn thay đổi: nút vật lý, báo động, khôi phục, auto, lệnh bị mất gói...
+def _sync_device_states_from_nodes():
+    now = time.time()
+    lr = living_room.state
+
+    actual = {
+        ("living_room", "led"): lr.get("led"),
+        ("living_room", "fan"): lr.get("fan"),
+    }
+
+    # Bếp/phòng ngủ lấy qua bridge: mất bridge hoặc chưa có telemetry thì KHÔNG publish giá trị cũ
+    if _bridge_online:
+        if state["kit_gas_raw"] is not None:
+            actual[("kitchen", "led")] = state["kit_led"]
+            actual[("kitchen", "fan")] = state["kit_fan"]
+        if state["bed_light"] is not None:
+            actual[("bedroom", "led")] = state["bed_led"]
+            actual[("bedroom", "fan")] = state["bed_fan"]
+
+    for key, is_on in actual.items():
+        if is_on is None:
+            continue
+        # Vừa có lệnh từ app: chờ node cập nhật, tránh app bị nhấp nháy ON -> OFF -> ON
+        if now - _device_cmd_ts.get(key, 0.0) < DEVICE_SYNC_GRACE_SEC:
+            continue
+        value = "ON" if is_on else "OFF"
+        if _device_states.get(key) == value:
+            continue
+        _device_states[key] = value
+        _publish_device_state(key[0], key[1], value)
 
 
 # Gửi toàn bộ cảm biến theo đúng cấu trúc topic của app
@@ -326,6 +364,15 @@ def _handle_app_command(room: str, device: str, raw_value: str):
     if (room, device) == ("kitchen", "gas_threshold"):
         return _handle_gas_threshold_command(raw_value)
 
+    # Đang báo gas/cháy: các node bỏ qua lệnh đèn/quạt (đèn + quạt phải giữ bật).
+    # Không nhận lệnh ở đây và đẩy lại trạng thái thật lên app để nút trên app trở về đúng.
+    if device in ("fan", "led") and state["fire_gas_level"] != "CLEAR":
+        msg = f"Đang báo gas/cháy, bỏ qua lệnh {room}/{device}."
+        _device_states.pop((room, device), None)   # buộc lần đồng bộ kế tiếp publish lại trạng thái thật
+        _device_cmd_ts.pop((room, device), None)
+        _notify_gateway_error(msg)
+        return False, msg
+
     value = _normalize_switch_payload(raw_value)
     if value is None:
         msg = f"Giá trị lệnh không hợp lệ: {room}/{device} = {raw_value}"
@@ -340,6 +387,7 @@ def _handle_app_command(room: str, device: str, raw_value: str):
         _notify_gateway_error(msg)
         return False, msg
 
+    _device_cmd_ts[(room, device)] = time.time()   # cho node thời gian cập nhật trước khi đồng bộ lại
     _device_states[(room, device)] = value
     _publish_device_state(room, device, value)
 
@@ -388,6 +436,8 @@ def _firebase_state_snapshot() -> dict:
             "temp": lr.get("temp"),
             "humid": lr.get("humid"),
             "motion": lr.get("motion"),
+            "fan": lr.get("fan"),
+            "led": lr.get("led"),
             "door_open": lr.get("door_open"),
             "door_locked": lr.get("door_locked"),
             "yolo_people_count": int(lr.get("yolo_people_count") or 0),
@@ -428,15 +478,31 @@ def _notify_fire_gas_firebase(context: str, level: str):
     )
 
 
+# Phòng khách phát sự kiện alarm/fire_gas mỗi lần gateway gọi trigger (nhiều lần mỗi giây khi đang báo).
+# Chỉ cho đi tiếp khi (level, context) đổi, tránh spam MQTT/Firestore.
+def _lr_alarm_event_changed(event_type: str, payload: dict) -> bool:
+    key = (payload.get("level"), payload.get("context"))
+    if _last_lr_alarm_key.get(event_type) == key:
+        return False
+    _last_lr_alarm_key[event_type] = key
+    return True
+
+
 def _on_living_room_event(event_type: str, payload: dict):
     if event_type == "door_status":
         _publish(TOPIC_DOOR_STATUS, payload, retain=True)
         _publish_door_state_to_app()      # cập nhật nút cửa trên app theo trạng thái thật
         fb.add_event("door_status", payload)
     elif event_type == "alarm":
+        if not _lr_alarm_event_changed("alarm", payload):
+            return
         _publish(TOPIC_ALARM, payload)
         fb.add_event("alarm", payload, level="warning")
     elif event_type == "fire_gas":
+        if payload.get("level") == "CLEAR":
+            _last_lr_alarm_key.clear()     # hết báo: lần báo sau (kể cả cùng mức) phải được phát lại
+        elif not _lr_alarm_event_changed("fire_gas", payload):
+            return
         _publish(TOPIC_FIRE_GAS, payload, retain=True)
         # Sự kiện fire_gas cho Firebase đã được ghi ở _set_fire_gas_alarm (chỉ khi đổi mức)
     elif event_type == "sensor_reading":
@@ -1086,6 +1152,7 @@ def main():
             if now - last_context_eval >= 1.0:
                 last_context_eval = now
                 evaluate_fire_gas_context()
+                _sync_device_states_from_nodes()   # đèn/quạt thật -> app (chỉ publish khi đổi)
 
             if now - last_app_publish >= APP_PUBLISH_INTERVAL_SEC:
                 last_app_publish = now
