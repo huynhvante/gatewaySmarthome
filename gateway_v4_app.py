@@ -22,9 +22,14 @@ BAUD_RATE = 115200
 ENABLE_FILE_LOG = False
 LOG_PATH = "sensor_log.jsonl"
 
-MQTT_HOST = "749e4310b50e423c8876f553789253da.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883
-MQTT_USERNAME = "hvt"
+# --- MQTT ---
+# Mặc định: HiveMQ Cloud (như cũ). Chạy không cần Internet: đặt trong /etc/smarthome-mqtt.env
+#   MQTT_HOST=127.0.0.1  MQTT_PORT=1883  MQTT_TLS=0  MQTT_USERNAME=pi  MQTT_PASSWORD=...
+# để nối Mosquitto trên chính Pi (Mosquitto tự bắc cầu lên HiveMQ khi có mạng).
+MQTT_HOST = os.environ.get("MQTT_HOST", "749e4310b50e423c8876f553789253da.s1.eu.hivemq.cloud")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
+MQTT_TLS = os.environ.get("MQTT_TLS", "1") != "0"
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "hvt")
 # Không để mật khẩu trong code. Chạy: export MQTT_PASSWORD='...'
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 MQTT_CLIENT_ID = "raspi-home-gateway"
@@ -58,14 +63,22 @@ _BRIDGE_IMPACT = "Dữ liệu bếp/phòng ngủ và cảnh báo gas/cháy của
 CONTROLLABLE_DEVICES = [
     ("living_room", "led"),
     ("living_room", "fan"),
+    ("living_room", "fan_level"),   # payload 0..3, state trả về "0".."3"
     ("living_room", "door"),
     ("bedroom", "led"),
     ("bedroom", "fan"),
+    ("bedroom", "fan_level"),       # payload 0..3, gửi FAN_LEVEL=n xuống ESP32
     ("bedroom", "buzzer"),
     ("kitchen", "led"),
     ("kitchen", "fan"),
+    ("kitchen", "fan_level"),
     ("kitchen", "gas_threshold"),
 ]
+# Chế độ AUTO/MANUAL riêng từng đèn/quạt: smarthome/<room>/<led|fan>_mode/set, payload AUTO | MANUAL,
+# trạng thái ở smarthome/<room>/<led|fan>_mode/state (retained).
+MODE_ROOMS = ("living_room", "bedroom", "kitchen")
+MODE_DEVICES = ("led", "fan")
+CONTROLLABLE_DEVICES += [(room, f"{dev}_mode") for room in MODE_ROOMS for dev in MODE_DEVICES]
 TOPIC_APP_CMD_SET = {
     f"{ROOT_TOPIC}/{room}/{device}/set": (room, device)
     for room, device in CONTROLLABLE_DEVICES
@@ -79,6 +92,8 @@ TOPIC_APP_CMD_SET = {
 GAS_THRESHOLD_MIN = 50
 GAS_THRESHOLD_MAX = 3000
 _GAS_TH_RE = re.compile(r"^GAS_TH=(\d{1,4})$")
+# Mức quạt ESP32 bếp/phòng ngủ: FAN_LEVEL=0..3 (firmware: FAN_PWM[] = {0, 100, 150, 200}, PWM 8 bit)
+_FAN_LEVEL_RE = re.compile(r"^FAN_LEVEL=([0-3])$")
 
 TEMP_FIRE_THRESHOLD = 55.0
 TEMP_RISE_THRESHOLD = 3.0
@@ -110,6 +125,9 @@ state = {
     "kit_gas_threshold": None,   # None cho tới khi node kitchen báo lại
     "kit_fan": False,
     "kit_led": False,
+    "kit_fan_level": None,
+    "kit_led_mode": None,
+    "kit_fan_mode": None,
     "kit_alarm": False,
 
     "bed_temp": None,
@@ -118,6 +136,9 @@ state = {
     "bed_motion": False,
     "bed_fan": False,
     "bed_led": False,
+    "bed_fan_level": None,    # 0..3 nếu firmware ESP32 gửi field fan_level, None = chưa hỗ trợ
+    "bed_led_mode": None,     # "AUTO"/"MANUAL" nếu firmware ESP32 gửi field led_mode, None = chưa hỗ trợ
+    "bed_fan_mode": None,
     "bed_alarm_level": 0,
     "fire_gas_context": "clear",
     "fire_gas_level": "CLEAR",
@@ -241,13 +262,28 @@ def _sync_device_states_from_nodes():
             actual[("bedroom", "led")] = state["bed_led"]
             actual[("bedroom", "fan")] = state["bed_fan"]
 
-    for key, is_on in actual.items():
-        if is_on is None:
-            continue
+    values = {key: ("ON" if is_on else "OFF") for key, is_on in actual.items() if is_on is not None}
+    # Mức quạt phòng khách: "0".."3"
+    if lr.get("fan_level") is not None:
+        values[("living_room", "fan_level")] = str(int(lr.get("fan_level")))
+
+    # Chế độ AUTO/MANUAL: phòng khách lấy trực tiếp; bếp/phòng ngủ chỉ khi firmware ESP32 có báo
+    for dev in MODE_DEVICES:
+        values[("living_room", f"{dev}_mode")] = living_room.get_mode(dev)
+    if _bridge_online:
+        for room, prefix in (("kitchen", "kit"), ("bedroom", "bed")):
+            for dev in MODE_DEVICES:
+                mode = state.get(f"{prefix}_{dev}_mode")
+                if mode in ("AUTO", "MANUAL"):
+                    values[(room, f"{dev}_mode")] = mode
+            lv = state.get(f"{prefix}_fan_level")
+            if lv is not None:
+                values[(room, "fan_level")] = str(lv)
+
+    for key, value in values.items():
         # Vừa có lệnh từ app: chờ node cập nhật, tránh app bị nhấp nháy ON -> OFF -> ON
         if now - _device_cmd_ts.get(key, 0.0) < DEVICE_SYNC_GRACE_SEC:
             continue
-        value = "ON" if is_on else "OFF"
         if _device_states.get(key) == value:
             continue
         _device_states[key] = value
@@ -357,6 +393,103 @@ def _handle_gas_threshold_command(raw_value: str):
     return True, f"Đã gửi ngưỡng gas {th}, chờ node xác nhận."
 
 
+def _parse_fan_level(raw_value: str):
+    """'2', 'FAN_2', 'LEVEL_2' -> 2; không hợp lệ -> None."""
+    v = raw_value.strip().upper()
+    for prefix in ("FAN_", "LEVEL_", "LEVEL"):
+        if v.startswith(prefix):
+            v = v[len(prefix):]
+            break
+    return int(v) if v in ("0", "1", "2", "3") else None
+
+
+# Mức quạt bếp/phòng ngủ: smarthome/<kitchen|bedroom>/fan_level/set, payload 0..3.
+# Gửi FAN_ON/FAN_OFF TRƯỚC rồi FAN_LEVEL=n: firmware cũ (chưa có PWM theo mức) vẫn bật/tắt được,
+# firmware mới nhận FAN_LEVEL sau cùng nên chạy đúng mức. Quạt chuyển MANUAL.
+def _handle_node_fan_level_command(room: str, raw_value: str):
+    level = _parse_fan_level(raw_value)
+    if level is None:
+        msg = f"Mức quạt không hợp lệ: '{raw_value}' (cần 0..3)."
+        _notify_gateway_error(msg)
+        return False, msg
+    ok = (send_command(room, "FAN_ON" if level > 0 else "FAN_OFF", force=True)
+          and send_command(room, f"FAN_LEVEL={level}", force=True))
+    if not ok:
+        msg = f"Không gửi được mức quạt {room} = {level}: bridge chưa kết nối."
+        _notify_gateway_error(msg)
+        return False, msg
+
+    now = time.time()
+    fan_value = "ON" if level > 0 else "OFF"
+    for dev, value in (("fan_level", str(level)), ("fan", fan_value)):
+        _device_cmd_ts[(room, dev)] = now
+        _device_states[(room, dev)] = value
+        _publish_device_state(room, dev, value)
+    _publish_mode_state(room, "fan", "MANUAL")
+    print(f"🎮 Nhận lệnh: {ROOT_TOPIC}/{room}/fan_level/set = {raw_value.strip()}  →  mức {level}")
+    return True, "ok"
+
+
+# Nhận mức quạt phòng khách từ app: smarthome/living_room/fan_level/set, payload 0..3
+# (chấp nhận cả "FAN_2", "LEVEL_2"). 0 = tắt. Vào chế độ manual giống lệnh FAN_ON/OFF.
+def _handle_living_fan_level_command(raw_value: str):
+    v = _parse_fan_level(raw_value)
+    if v is None:
+        msg = f"Mức quạt không hợp lệ: '{raw_value}' (cần 0..3)."
+        _notify_gateway_error(msg)
+        return False, msg
+
+    living_room.set_fan_level_manual(v, source="app")
+    lr = living_room.state
+    level = str(int(lr.get("fan_level") or 0))
+    fan_value = "ON" if lr.get("fan") else "OFF"
+
+    now = time.time()
+    for dev, value in (("fan_level", level), ("fan", fan_value)):
+        _device_cmd_ts[("living_room", dev)] = now
+        _device_states[("living_room", dev)] = value
+        _publish_device_state("living_room", dev, value)
+    _publish_mode_state("living_room", "fan", living_room.get_mode("fan"))
+    print(f"🎮 Nhận lệnh: {ROOT_TOPIC}/living_room/fan_level/set = {raw_value.strip()}  →  mức {level}")
+    return True, "ok"
+
+
+def _publish_mode_state(room: str, device: str, mode: str):
+    key = (room, f"{device}_mode")
+    _device_cmd_ts[key] = time.time()   # chờ node xác nhận trước khi đồng bộ lại, tránh nút trên app nhảy qua lại
+    _device_states[key] = mode
+    _publish_device_state(room, f"{device}_mode", mode)
+
+
+# Đổi chế độ AUTO/MANUAL của 1 đèn/quạt: smarthome/<room>/<led|fan>_mode/set, payload AUTO | MANUAL.
+#  - Phòng khách: living_room.set_mode() (MANUAL giữ nguyên trạng thái, AUTO đánh giá lại theo cảm biến).
+#  - Bếp/phòng ngủ: gửi LED_AUTO / LED_MANUAL / FAN_AUTO / FAN_MANUAL xuống ESP32 qua bridge.
+#    Firmware ESP32 cần: (1) hiểu 4 lệnh này, (2) gửi thêm "led_mode"/"fan_mode": "AUTO"|"MANUAL"
+#    trong JSON telemetry. Chưa có (2) thì gateway báo lên app theo lệnh cuối cùng đã gửi.
+def _handle_mode_command(room: str, device: str, raw_value: str):
+    mode = raw_value.strip().upper()
+    if mode in ("A", "AUTOMATIC"):
+        mode = "AUTO"
+    elif mode in ("M", "MANUALLY"):
+        mode = "MANUAL"
+    if room not in MODE_ROOMS or device not in MODE_DEVICES or mode not in ("AUTO", "MANUAL"):
+        msg = f"Lệnh chế độ không hợp lệ: {room}/{device}_mode = '{raw_value}' (cần AUTO hoặc MANUAL)."
+        _notify_gateway_error(msg)
+        return False, msg
+
+    if room == "living_room":
+        living_room.set_mode(device, mode, source="app")
+        _publish_mode_state(room, device, living_room.get_mode(device))
+    else:
+        if not send_command(room, f"{device.upper()}_{mode}", force=True):
+            msg = f"Không gửi được lệnh {room}/{device}_mode = {mode}: bridge chưa kết nối."
+            _notify_gateway_error(msg)
+            return False, msg
+        _publish_mode_state(room, device, mode)
+    print(f"🎮 Nhận lệnh: {ROOT_TOPIC}/{room}/{device}_mode/set = {mode}")
+    return True, "ok"
+
+
 # Xử lý lệnh app publish vào smarthome/<room>/<device>/set (hoặc lệnh từ Firestore).
 # Trả về (ok, message).
 def _handle_app_command(room: str, device: str, raw_value: str):
@@ -366,12 +499,22 @@ def _handle_app_command(room: str, device: str, raw_value: str):
 
     # Đang báo gas/cháy: các node bỏ qua lệnh đèn/quạt (đèn + quạt phải giữ bật).
     # Không nhận lệnh ở đây và đẩy lại trạng thái thật lên app để nút trên app trở về đúng.
-    if device in ("fan", "led") and state["fire_gas_level"] != "CLEAR":
+    if (device in ("fan", "led", "fan_level") or device.endswith("_mode")) and state["fire_gas_level"] != "CLEAR":
         msg = f"Đang báo gas/cháy, bỏ qua lệnh {room}/{device}."
         _device_states.pop((room, device), None)   # buộc lần đồng bộ kế tiếp publish lại trạng thái thật
         _device_cmd_ts.pop((room, device), None)
         _notify_gateway_error(msg)
         return False, msg
+
+    # Mức quạt phòng khách là số 0..3, không phải ON/OFF nên xử lý riêng
+    if (room, device) == ("living_room", "fan_level"):
+        return _handle_living_fan_level_command(raw_value)
+    if device == "fan_level" and room in ("kitchen", "bedroom"):
+        return _handle_node_fan_level_command(room, raw_value)
+
+    # Chế độ AUTO/MANUAL của từng đèn/quạt
+    if device.endswith("_mode"):
+        return _handle_mode_command(room, device[:-len("_mode")], raw_value)
 
     value = _normalize_switch_payload(raw_value)
     if value is None:
@@ -390,6 +533,8 @@ def _handle_app_command(room: str, device: str, raw_value: str):
     _device_cmd_ts[(room, device)] = time.time()   # cho node thời gian cập nhật trước khi đồng bộ lại
     _device_states[(room, device)] = value
     _publish_device_state(room, device, value)
+    if device in MODE_DEVICES and room in MODE_ROOMS:
+        _publish_mode_state(room, device, "MANUAL")   # bật/tắt tay = thiết bị đó chuyển MANUAL
 
     print(f"🎮 Nhận lệnh: {ROOT_TOPIC}/{room}/{device}/set = {value}  →  "
           f"đã cập nhật {ROOT_TOPIC}/{room}/{device}/state")
@@ -437,6 +582,7 @@ def _firebase_state_snapshot() -> dict:
             "humid": lr.get("humid"),
             "motion": lr.get("motion"),
             "fan": lr.get("fan"),
+            "fan_level": lr.get("fan_level"),
             "led": lr.get("led"),
             "door_open": lr.get("door_open"),
             "door_locked": lr.get("door_locked"),
@@ -467,6 +613,7 @@ _LEVEL_TITLE = {
 
 # Ghi sự kiện + thông báo khi báo động gas/cháy đổi (context, level)
 def _notify_fire_gas_firebase(context: str, level: str):
+    
     severity = "critical" if level in ("MAX", "RED") else "warning"
     payload = {**_alarm_details(), "level": level, "context": context}
     fb.add_event("fire_gas", payload, level=severity)
@@ -514,6 +661,14 @@ def _on_living_room_event(event_type: str, payload: dict):
             value = "ON" if payload.get("on") else "OFF"
             _device_states[("living_room", dev)] = value
             _publish_device_state("living_room", dev, value)
+        if dev == "fan" and payload.get("level") is not None:
+            level = str(int(payload["level"]))
+            _device_states[("living_room", "fan_level")] = level
+            _publish_device_state("living_room", "fan_level", level)
+        if dev in MODE_DEVICES:
+            mode = living_room.get_mode(dev)
+            _device_states[("living_room", f"{dev}_mode")] = mode
+            _publish_device_state("living_room", f"{dev}_mode", mode)
 
 
 def _on_mqtt_connect(client, userdata, flags, rc, properties=None):
@@ -569,7 +724,9 @@ def setup_mqtt():
         _mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID)
 
     _mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-    _mqtt_client.tls_set()
+    if MQTT_TLS:
+        _mqtt_client.tls_set()
+    print(f"[MQTT] Broker: {MQTT_HOST}:{MQTT_PORT} (TLS={'bật' if MQTT_TLS else 'tắt'}, user={MQTT_USERNAME})")
     _mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
     _mqtt_client.will_set(TOPIC_HOUSE_STATUS, "offline", qos=1, retain=True)
     _mqtt_client.on_connect = _on_mqtt_connect
@@ -682,6 +839,8 @@ def send_command(target: str, cmd: str, force: bool = False) -> bool:
         "ALERT_ON", "ALERT_OFF",
         "ALARM_MED", "ALARM_MAX", "ALARM_OFF",
         "ON", "OFF", "AUTO",
+        # Chế độ riêng từng thiết bị (firmware ESP32 bếp/phòng ngủ cần hỗ trợ, xem _handle_mode_command)
+        "LED_AUTO", "LED_MANUAL", "FAN_AUTO", "FAN_MANUAL",
     }
     target = target.strip().lower()
     cmd = cmd.strip().upper()
@@ -694,7 +853,9 @@ def send_command(target: str, cmd: str, force: bool = False) -> bool:
         and GAS_THRESHOLD_MIN <= int(gas_match.group(1)) <= GAS_THRESHOLD_MAX
     )
 
-    if target not in allowed_targets or not (cmd in allowed_cmds or valid_gas_cmd):
+    valid_fan_level_cmd = bool(_FAN_LEVEL_RE.match(cmd)) and target in ("kitchen", "bedroom")
+
+    if target not in allowed_targets or not (cmd in allowed_cmds or valid_gas_cmd or valid_fan_level_cmd):
         print(f"[WARN] Lệnh không hợp lệ: {target}:{cmd}")
         return False
 
@@ -748,7 +909,7 @@ def _is_night():
     hour = datetime.now().hour
     return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
 
-## Cập nhật thời điểm cuối cùng có người hiện diện trong nhà (motion PIR hoặc YOLO)
+## Cập nhật thời điểm cuối cùng có người hiện diện trong nhà (motion PIR)
 def _update_presence():
     global _last_presence_ts
     lr = living_room.state
@@ -944,6 +1105,18 @@ def evaluate_fire_gas_context():
 # ==========================================
 # PARSE DỮ LIỆU JSON TỪ BRIDGE
 # ==========================================
+def _read_node_modes(data: dict, prefix: str):
+    """Firmware ESP32 mới gửi "led_mode"/"fan_mode": "AUTO"|"MANUAL" và "fan_level": 0..3
+    (firmware cũ không có -> bỏ qua, app hiển thị theo lệnh cuối)."""
+    lv = data.get("fan_level")
+    if isinstance(lv, (int, float)) and 0 <= int(lv) <= 3:
+        state[f"{prefix}_fan_level"] = int(lv)
+    for dev in MODE_DEVICES:
+        v = data.get(f"{dev}_mode")
+        if isinstance(v, str) and v.strip().upper() in ("AUTO", "MANUAL"):
+            state[f"{prefix}_{dev}_mode"] = v.strip().upper()
+
+
 def parse_data(line: str) -> bool:
     line = line.strip()
     if not line.startswith("{"):
@@ -989,6 +1162,7 @@ def parse_data(line: str) -> bool:
         state["kit_gas_voltage"] = round(float(kit_gas_voltage), 3) if kit_gas_voltage is not None else None
         state["kit_fan"] = bool(data.get("fan", False))
         state["kit_led"] = bool(data.get("led", False))
+        _read_node_modes(data, "kit")
         state["kit_alarm"] = bool(data.get("alarm", False))
 
         # Ngưỡng là field tuỳ chọn: firmware cũ chưa gửi thì giữ giá trị trước đó, không crash
@@ -1037,6 +1211,7 @@ def parse_data(line: str) -> bool:
         state["bed_motion"] = bool(data.get("motion", False))
         state["bed_fan"] = bool(data.get("fan", False))
         state["bed_led"] = bool(data.get("led", False))
+        _read_node_modes(data, "bed")
         state["bed_alarm_level"] = int(data.get("alarm_level", 0))
 
         _update_presence()

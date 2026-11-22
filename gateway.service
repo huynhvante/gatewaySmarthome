@@ -1,0 +1,22 @@
+# /etc/systemd/system/gateway.service
+[Unit]
+Description=Smart home gateway (gateway_v4_app.py)
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hvt
+WorkingDirectory=/home/hvt/code/living_gateway
+EnvironmentFile=-/etc/face_door.env
+# Broker MQTT trong nhà (Mosquitto trên Pi). Phải đứng SAU để ghi đè cấu hình HiveMQ ở trên.
+EnvironmentFile=-/etc/smarthome-mqtt.env
+Environment=PYTHONUNBUFFERED=1
+# Dấu "+" = chạy bằng root: chuẩn bị PWM phần cứng cho quạt (GPIO19) và giữ INA (GPIO23) ở mức LOW
+ExecStartPre=+/usr/local/sbin/fan-pwm-setup.sh hvt
+ExecStart=/usr/bin/python3 gateway_v4_app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

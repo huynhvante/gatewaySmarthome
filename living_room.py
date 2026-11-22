@@ -1,1124 +1,1000 @@
-import serial
-import json
-import re
-import time
 import os
-import signal
-import sys
+import time
+import json
 import threading
 from datetime import datetime
 
-import paho.mqtt.client as mqtt
-
-import living_room
-from firebase_bridge import FirebaseBridge
+import RPi.GPIO as GPIO
+import smbus2
+import board
+import adafruit_dht
 
 # ==========================================
-# CẤU HÌNH
+# CẤU HÌNH CHUNG
 # ==========================================
-PORT = "/dev/ttyACM0"
-BAUD_RATE = 115200
+PIR_PIN      = 27 # GPIO27 (chân vật lý 13)
+REED_PIN     = 17 # GPIO17 (chân vật lý 11)
 
-ENABLE_FILE_LOG = False
-LOG_PATH = "sensor_log.jsonl"
+SERVO_PIN    = 18      # SG90 - dây tín hiệu vào GPIO18 (chân vật lý 12)
+BUZZER_PIN   = 25    # GPIO25 (chân vật lý 22) - active HIGH
 
-MQTT_HOST = "749e4310b50e423c8876f553789253da.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883
-MQTT_USERNAME = "hvt"
-# Không để mật khẩu trong code. Chạy: export MQTT_PASSWORD='...'
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
-MQTT_CLIENT_ID = "raspi-home-gateway"
+FAN_INA_PIN  = 23   # GPIO23 (chân vật lý 16)
+FAN_INB_PIN  = 19   # GPIO19 (chân vật lý 35) - PWM PHẦN CỨNG PWM0_CHAN3 của chip RP1 (trước đây GPIO24 chân 18)
+# INA phải luôn LOW: module driver có điện trở kéo lên, INA bỏ trống = quạt tự quay.
+# /boot/firmware/config.txt có "gpio=23=op,dl" để kéo LOW ngay từ lúc Pi khởi động.
+FAN_PWM_FREQ = 2000
+FAN_SPEED    = 80
+# Mức quạt từ app (smarthome/living_room/fan_level/set): 0 = tắt, 1..3 = duty PWM (%).
+# Mức 3 = 80% đúng bằng tốc độ cũ; chế độ AUTO luôn chạy mức FAN_AUTO_LEVEL.
+FAN_LEVEL_DUTY = (0, 50, 65, 80)
+FAN_AUTO_LEVEL = 3
 
-# --- Firebase (Firestore) ---
-# File khoá đọc từ biến môi trường FIREBASE_KEY_PATH (mặc định: serviceAccountKey.json cạnh gateway.py)
-FIREBASE_GATEWAY_ID = MQTT_CLIENT_ID
-FIREBASE_STATE_INTERVAL_SEC = 15.0      # chu kỳ ghi state/<gateway_id>
-FIREBASE_FCM_TOPIC = None               # đặt "alerts" nếu app Android đã subscribe topic FCM
+LED_PIN      = 22   # GPIO22 (chân vật lý 15)
+DHT_PIN      = board.D4           # truyền thẳng vào adafruit_dht.DHT11 chân GPIO4 (chân vật lý 7)
+I2C_BUS      = 1 # chân vật lý 3/5 (SDA/SCL) 
+BH1750_ADDR  = 0x23
 
-# --- Topic điều khiển / trạng thái nội bộ (giữ nguyên) ---
-TOPIC_DOOR_CMD = "home/livingroom/door/cmd"
-TOPIC_FACE_UNLOCK = "home/livingroom/door/face_unlock"
-TOPIC_DOOR_STATUS = "home/livingroom/door/status"
-TOPIC_ALARM = "home/livingroom/alarm"
-TOPIC_FIRE_GAS = "home/fire_gas/alarm"
-TOPIC_FIRE_GAS_ACK = "home/fire_gas/ack"
-TOPIC_HOUSE_STATUS = "home/gateway/status"
+# ==========================================
+# CẤU HÌNH SERVO SG90 (đã test thực tế)
+# ==========================================
+SERVO_FREQ         = 50
+SERVO_MIN_DUTY     = 2.5     # ~0.5 ms -> 0°
+SERVO_MAX_DUTY     = 12.0    # ~2.4 ms -> 180°
+SERVO_LOCK_ANGLE   = 0       # góc khoá
+SERVO_UNLOCK_ANGLE = 90      # góc mở khoá
+SERVO_MOVE_SEC     = 0.3     # giữ xung 0.3 s rồi nhả (test cho thấy không còn giật)
 
-# Topic cho app Android: smarthome/<room>/<device>/<metric>, payload là chuỗi thuần
-ROOT_TOPIC = "smarthome"
-APP_PUBLISH_INTERVAL_SEC = 5.0
+# ==========================================
+# NGƯỠNG TỰ ĐỘNG
+# ==========================================
+# ---- Đèn: trễ 50/100 lux (giống bedroom) ----
+LUX_ON_THRESHOLD  = 50.0     # có người + < 50 lux -> bật đèn
+LUX_OFF_THRESHOLD = 100.0    # >= 100 lux trong BRIGHT_SAMPLES_TO_TURN_OFF mẫu liên tiếp -> tắt đèn
+BRIGHT_SAMPLES_TO_TURN_OFF = 2
+LUX_THRESHOLD     = LUX_ON_THRESHOLD   # giữ tên cũ cho code khác (nếu có) đang dùng
+LUX_SAMPLE_SEC    = 0.3      # đọc BH1750 mỗi 300 ms
+SENSOR_INTERVAL_SEC = 2.0    # đọc DHT + gửi telemetry định kỳ mỗi 2 s
 
-# Trạng thái bridge (cổng serial) báo cho app
-TOPIC_BRIDGE_STATE = f"{ROOT_TOPIC}/gateway/bridge/state"   # "ONLINE" | "OFFLINE" (retained)
-TOPIC_BRIDGE_ERROR = f"{ROOT_TOPIC}/gateway/bridge/error"   # nội dung lỗi (retained), rỗng khi bình thường
-TOPIC_GATEWAY_ERROR = f"{ROOT_TOPIC}/gateway/error"         # lỗi tức thời, vd lệnh không gửi được (không retained)
-BRIDGE_RETRY_SEC = 5.0                                       # chu kỳ tự thử mở lại cổng serial
-_BRIDGE_IMPACT = "Dữ liệu bếp/phòng ngủ và cảnh báo gas/cháy của 2 phòng này tạm thời không hoạt động."
+# ---- Quạt: chỉ bật khi có người VÀ nóng (trễ 28/26 °C, giống bedroom) ----
+FAN_TEMP_ON_C  = 28.0        # >= nhiệt độ này thì cho phép bật quạt
+FAN_TEMP_OFF_C = 26.0        # <= nhiệt độ này thì tắt quạt
 
-CONTROLLABLE_DEVICES = [
-    ("living_room", "led"),
-    ("living_room", "fan"),
-    ("living_room", "door"),
-    ("bedroom", "led"),
-    ("bedroom", "fan"),
-    ("bedroom", "buzzer"),
-    ("kitchen", "led"),
-    ("kitchen", "fan"),
-    ("kitchen", "gas_threshold"),
-]
-TOPIC_APP_CMD_SET = {
-    f"{ROOT_TOPIC}/{room}/{device}/set": (room, device)
-    for room, device in CONTROLLABLE_DEVICES
-}
+# ---- PIR: lọc + xác nhận có người bằng 2 xung (giống bedroom) ----
+PIR_WARMUP_SEC         = 30.0   # bỏ qua PIR 30 s đầu (module đang ổn định)
+PIR_STARTUP_LOW_SEC    = 3.0    # sau warmup, PIR phải LOW liên tục 3 s mới READY
+PIR_SAMPLE_SEC         = 0.02   # lấy mẫu GPIO mỗi 20 ms
+PIR_DEBUG_RAW          = False  # True = in mọi thay đổi RAW của chân PIR
+ENTRY_MIN_INTERVAL_SEC = 2.0    # cạnh lên thứ 2 phải cách cạnh đầu >= 2 s
+ENTRY_WINDOW_SEC       = 5.0    # ... và <= 5 s, nếu không thì về EMPTY
+PRESENCE_HOLD_SEC      = 5.0    # đã OCCUPIED: PIR LOW liên tục 5 s -> EMPTY
+MOTION_HOLD_SEC        = PRESENCE_HOLD_SEC   # giữ tên cũ
 
-# Ngưỡng gas đặt qua app: smarthome/kitchen/gas_threshold/set, payload là số nguyên 50..3000.
-# Gateway chuyển xuống node kitchen bằng lệnh "kitchen:GAS_TH=<số>\n".
-# Giá trị đang dùng thật sự là giá trị node kitchen báo lại trong telemetry (state["kit_gas_threshold"]).
-# Khoảng này phải khớp GAS_TH_MIN / GAS_TH_MAX trong firmware kitchen.
-# Báo gas chỉ so gas_raw với ngưỡng này (không dùng điện áp).
-GAS_THRESHOLD_MIN = 50
-GAS_THRESHOLD_MAX = 3000
-_GAS_TH_RE = re.compile(r"^GAS_TH=(\d{1,4})$")
+AUTO_LOCK_AFTER_SEC = 3      # mở khoá 3 giây rồi tự khoá lại (theo đề cương)
+DOOR_OPEN_WAIT_MAX  = 5     # nếu cửa vẫn đang mở thì chờ tối đa 5 s rồi mới khoá
 
-TEMP_FIRE_THRESHOLD = 55.0
-TEMP_RISE_THRESHOLD = 3.0
-TEMP_RISE_WINDOW_SEC = 10.0
-UNOCCUPIED_AFTER_SEC = 30 * 60
-NIGHT_START_HOUR = 23
-NIGHT_END_HOUR = 6
-NIGHT_UNLOCK_AFTER_SEC = 30
-DAY_ESCALATE_AFTER_SEC = 60
-COMMAND_REPEAT_SEC = 10
-
-# Hết nguy hiểm phải liên tục bấy lâu mới tắt báo động (tránh còi kêu/tắt nhấp nháy khi gas dao động quanh ngưỡng)
-CLEAR_HOLD_SEC = 10
-# Số lần gửi lệnh tắt còi (ESP-NOW không có xác nhận, gửi lặp để tránh mất gói)
-ALARM_OFF_REPEAT = 3
-ALARM_OFF_REPEAT_GAP_SEC = 0.3
+# ==========================================
+# NÚT NHẤN TÍCH HỢP LED
+# SIG2: ngõ ra trạng thái nút (mặc định HIGH, nhấn = LOW)
+# SIG1: ngõ vào điều khiển LED nút (mặc định LOW, HIGH = sáng)
+# ==========================================
+BTN_LED_SIG2 = 5      # nút vàng (đèn) chân vật lý 29
+BTN_LED_SIG1 = 6      # nút vàng (đèn) chân vật lý 31
+BTN_FAN_SIG2 = 13     # nút xanh (quạt) chân vật lý 33
+BTN_FAN_SIG1 = 26     # nút xanh (quạt) chân vật lý 37
+BTN_DEBOUNCE_SEC = 0.03
+BTN_LONG_PRESS_SEC = 2.0
+BTN_OVERRIDE_RELEASE_SEC = 30 * 60   # không có chuyển động bấy lâu -> về auto (0 = giữ mãi)
 
 # ==========================================
 # TRẠNG THÁI TOÀN CỤC
 # ==========================================
 state = {
-    "kit_temp": None,
-    "kit_humid": None,
-    "kit_gas_raw": None,
-    "kit_gas_voltage": None,     # chỉ để hiển thị / báo cáo, không dùng để quyết định báo động
-    "kit_gas_threshold": None,   # None cho tới khi node kitchen báo lại
-    "kit_fan": False,
-    "kit_led": False,
-    "kit_alarm": False,
-
-    "bed_temp": None,
-    "bed_humid": None,
-    "bed_light": None,
-    "bed_motion": False,
-    "bed_fan": False,
-    "bed_led": False,
-    "bed_alarm_level": 0,
-    "fire_gas_context": "clear",
+    "motion": False,
+    "last_motion_ts": 0.0,
+    "temp": None,
+    "humid": None,
+    "lux": None,
+    "fan": False,
+    "fan_level": 0,          # 0..3
+    "led": False,
+    "door_locked": True,
+    "door_open": False,
+    "yolo_people_count": 0,
+    "last_yolo_ts": 0.0,
+    "fire_gas_alarm": False,
     "fire_gas_level": "CLEAR",
-    "fire_gas_reason": "none",
 }
 
-ser = None
-_log_fh = None
-_shutdown = False
-_living_room_thread = None
-_kit_temp_history = []
-_danger_started_ts = None
-_safe_since = None         # thời điểm bắt đầu hết nguy hiểm (để giữ báo động thêm CLEAR_HOLD_SEC)
-_day_escalated = False
-_unlock_sent = False
-_manual_ack_ts = 0.0
-_last_presence_ts = time.time()
-_last_command = {}
-_mqtt_client = None
-_last_gas_alert = None
-_device_states = {}
-_last_fb_alarm = None      # (context, level) đã ghi lên Firebase, tránh ghi lặp mỗi giây
-
-# Trạng thái bridge: None = chưa biết, True/False sau lần thử mở cổng đầu tiên
-_bridge_online = None
-_bridge_error = ""
+_last_authorized_unlock_ts = 0.0
+_dht = None
+i2c_bus = None
+_servo_pwm = None
+_fan_pwm = None
 
 
-# ==========================================
-# GHI LOG AN TOÀN
-# ==========================================
-def safe_append_log(record: dict):
-    global _log_fh
-    if not ENABLE_FILE_LOG:
+class HardwarePWM:
+    CHANNEL = 3                      # GPIO19 = PWM0 kênh 3
+
+    def __init__(self, freq_hz: int):
+        self.dir = self._find_channel_dir()
+        self.period_ns = int(1_000_000_000 / freq_hz)
+        self._write("duty_cycle", 0)              # duty phải <= period trước khi đổi period
+        self._write("period", self.period_ns)
+        self._write("duty_cycle", 0)
+        self._write("enable", 1)
+
+    @classmethod
+    def _find_channel_dir(cls) -> str:
+        base = "/sys/class/pwm"
+        chips = sorted(os.listdir(base)) if os.path.isdir(base) else []
+        # PWM0 của RP1 (GPIO12/13/18/19) có địa chỉ ...98000; PWM1 là quạt tản nhiệt của Pi 5 -> KHÔNG đụng vào
+        for c in chips:
+            if "98000" in os.path.realpath(os.path.join(base, c)):
+                d = os.path.join(base, c, f"pwm{cls.CHANNEL}")
+                if os.path.isdir(d):
+                    return d
+        raise RuntimeError("chưa có kênh PWM0/pwm3 (chạy fan-pwm-setup.sh hoặc kiểm tra gateway.service)")
+
+    def _write(self, name: str, value: int):
+        with open(os.path.join(self.dir, name), "w") as f:
+            f.write(str(int(value)))
+
+    def start(self, duty: float):
+        self.ChangeDutyCycle(duty)
+
+    def ChangeDutyCycle(self, duty: float):
+        duty = max(0.0, min(100.0, float(duty)))
+        self._write("duty_cycle", self.period_ns * duty / 100.0)
+
+    def stop(self):
+        self._write("duty_cycle", 0)              # giữ kênh bật, chân ở mức thấp
+_stop_flag = False
+_last_lux_warn_ts = 0.0
+_event_callback = None
+
+# Quạt ramp: tránh sụt áp khi bật quạt từ 0 -> 100% duty cycle
+_fan_ramp_stop = threading.Event()
+_fan_ramp_thread = None
+FAN_RAMP_TIME = 1.5   
+FAN_RAMP_STEPS = 20    
+
+# Manual từ app: RIÊNG cho từng thiết bị, giữ đến khi app gửi AUTO cho thiết bị đó
+# (smarthome/living_room/<led|fan>_mode/set). Bật/tắt tay từ app cũng chuyển thiết bị đó sang manual.
+_app_manual = {"led": False, "fan": False}
+_last_fan_level = FAN_AUTO_LEVEL   # mức dùng khi bật quạt bằng công tắc ON/OFF hoặc nút vật lý
+# Yêu cầu vòng chính đánh giá auto ngay (giống lastSensorMs = millis() - SENSOR_INTERVAL_MS bên C)
+_force_eval = False
+
+# Nút nhấn quyết định thiết bị (ưu tiên hơn tự động)
+_btn_override = {"led": False, "fan": False}
+_pre_alarm_snapshot = None
+_last_alarm_key = None
+_last_btn_ts = 0.0
+_btn_thread = None
+
+# Khoá servo: tránh nhiều luồng cùng điều khiển servo một lúc
+_servo_lock = threading.Lock()
+# "Số thế hệ" của lần mở/khoá gần nhất: luồng auto-relock cũ tự huỷ nếu có lệnh mới hơn
+_unlock_generation = 0
+
+
+def set_event_callback(callback):
+    """Gateway đăng ký callback để nhận sự kiện phòng khách và publish MQTT tập trung."""
+    global _event_callback
+    _event_callback = callback
+
+
+def _emit_event(event_type: str, payload: dict):
+    if _event_callback is None:
         return
     try:
-        if _log_fh is None:
-            _log_fh = open(LOG_PATH, "a", buffering=1)
-        line = json.dumps(record, ensure_ascii=False)
-        _log_fh.write(line + "\n")
-        _log_fh.flush()
-        os.fsync(_log_fh.fileno())
+        _event_callback(event_type, payload)
     except Exception as e:
-        print(f"[WARN] Ghi log thất bại: {e}")
+        print(f"[WARN] Callback gateway lỗi: {e}")
 
 
-# hàm publish MQTT, payload là dict, sẽ json.dumps trước khi gửi
-def _publish(topic: str, payload: dict, retain: bool = False):
-    if _mqtt_client is None:
-        return
+# ==========================================
+# GPIO / CẢM BIẾN - KHỞI TẠO
+# ==========================================
+def setup_gpio():
+    global _servo_pwm, _fan_pwm, _dht, i2c_bus
+
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+
+    GPIO.setup(PIR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)   # giống INPUT_PULLDOWN bên ESP
+    GPIO.setup(REED_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # đóng cửa = mạch kín = LOW
+    GPIO.setup(BUZZER_PIN, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+    GPIO.setup(FAN_INA_PIN, GPIO.OUT, initial=GPIO.LOW)
+    # INB: ưu tiên PWM phần cứng (không tốn CPU). Không được GPIO.setup chân này trước,
+    # vì như vậy sẽ chuyển GPIO19 khỏi chức năng PWM.
     try:
-        _mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=1, retain=retain)
+        _fan_pwm = HardwarePWM(FAN_PWM_FREQ)
+        print(f"[LIVING ROOM] Quạt dùng PWM phần cứng ({_fan_pwm.dir}, {FAN_PWM_FREQ} Hz).")
     except Exception as e:
-        print(f"[WARN] MQTT publish lỗi: {e}")
+        print(f"[WARN] Không dùng được PWM phần cứng cho quạt ({e}). "
+              "Tạm dùng PWM phần mềm (tốn CPU).")
+        GPIO.setup(FAN_INB_PIN, GPIO.OUT, initial=GPIO.LOW)
+        _fan_pwm = GPIO.PWM(FAN_INB_PIN, FAN_PWM_FREQ)
+    _fan_pwm.start(0)
 
+    GPIO.setup(SERVO_PIN, GPIO.OUT)
+    _servo_pwm = GPIO.PWM(SERVO_PIN, SERVO_FREQ)
+    _servo_pwm.start(0)   # duty 0 = không phát xung, servo đứng yên
 
-# Publish chuỗi thuần cho app Android
-def _publish_raw(topic: str, value, qos: int = 0, retain: bool = False):
-    if _mqtt_client is None:
-        return
+    GPIO.setup(BTN_LED_SIG2, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(BTN_FAN_SIG2, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(BTN_LED_SIG1, GPIO.OUT, initial=GPIO.HIGH)   # đèn đang tắt -> LED nút sáng
+    GPIO.setup(BTN_FAN_SIG1, GPIO.OUT, initial=GPIO.HIGH)
+
+    _dht = adafruit_dht.DHT11(DHT_PIN, use_pulseio=False)
+
     try:
-        _mqtt_client.publish(topic, str(value), qos=qos, retain=retain)
-    except Exception as e:
-        print(f"[WARN] MQTT publish lỗi: {e}")
-
-
-def _pub_sensor(room: str, device: str, metric: str, value):
-    if value is None:
-        return
-    if isinstance(value, bool):
-        value = int(value)
-    _publish_raw(f"{ROOT_TOPIC}/{room}/{device}/{metric}", value)
-
-
-# Publish lại trạng thái cho app: smarthome/<room>/<device>/state (retained)
-def _publish_device_state(room: str, device: str, value: str):
-    _publish_raw(f"{ROOT_TOPIC}/{room}/{device}/state", value, qos=1, retain=True)
-
-
-# Đồng bộ trạng thái khoá cửa THẬT lên app (khoá tự lại sau vài giây, app cần biết)
-def _publish_door_state_to_app():
-    lr = living_room.state
-    value = "OFF" if lr.get("door_locked") else "ON"   # quy ước: ON = mở khoá, OFF = đã khoá
-    if _device_states.get(("living_room", "door")) == value:
-        return
-    _device_states[("living_room", "door")] = value
-    _publish_device_state("living_room", "door", value)
-
-
-# Đồng bộ ngưỡng gas THẬT (do node kitchen báo lại) lên app
-def _publish_gas_threshold_state_to_app():
-    th = state.get("kit_gas_threshold")
-    if th is None:
-        return
-    value = str(th)
-    if _device_states.get(("kitchen", "gas_threshold")) == value:
-        return
-    _device_states[("kitchen", "gas_threshold")] = value
-    _publish_device_state("kitchen", "gas_threshold", value)
-
-
-# Gửi toàn bộ cảm biến theo đúng cấu trúc topic của app
-def publish_sensors_to_app():
-    lr = living_room.state
-
-    # Living room (không phụ thuộc bridge)
-    _pub_sensor("living_room", "pir", "motion", lr.get("motion"))
-    _pub_sensor("living_room", "dht", "temperature", lr.get("temp"))
-    _pub_sensor("living_room", "dht", "humidity", lr.get("humid"))
-    _pub_sensor("living_room", "reed", "open", lr.get("door_open"))
-
-    # Bếp/phòng ngủ lấy qua bridge: mất bridge thì KHÔNG publish giá trị cũ như thể còn mới
-    if not _bridge_online:
-        return
-
-    # Kitchen
-    _pub_sensor("kitchen", "gas_sensor", "value", state["kit_gas_raw"])
-    _pub_sensor("kitchen", "dht", "temperature", state["kit_temp"])
-    _pub_sensor("kitchen", "dht", "humidity", state["kit_humid"])
-
-    # Bedroom
-    if state["bed_light"] is not None:
-        _pub_sensor("bedroom", "pir", "motion", state["bed_motion"])
-        _pub_sensor("bedroom", "dht", "temperature", state["bed_temp"])
-        _pub_sensor("bedroom", "dht", "humidity", state["bed_humid"])
-        _pub_sensor("bedroom", "light_sensor", "lux", state["bed_light"])
-
-
-# Alert gas: chỉ publish khi đổi trạng thái, retained để app mở lên vẫn thấy
-def _publish_gas_alert(active: bool):
-    global _last_gas_alert
-    if active == _last_gas_alert:
-        return
-    _last_gas_alert = active
-    _publish_raw(
-        f"{ROOT_TOPIC}/kitchen/gas_sensor/alert",
-        "1" if active else "0",
-        qos=1,
-        retain=True,
-    )
-
-
-# Chuẩn hoá payload lệnh: nhiều app gửi ON/OFF, 1/0, true/false...
-def _normalize_switch_payload(raw: str):
-    v = raw.strip().upper()
-    if v in ("ON", "1", "TRUE", "OPEN", "UNLOCK"):
-        return "ON"
-    if v in ("OFF", "0", "FALSE", "CLOSE", "LOCK"):
-        return "OFF"
-    return None
-
-
-# Trả về chuỗi trạng thái thay vì True/False:
-#   "ok"          = đã gửi lệnh tới phần cứng
-#   "failed"      = có phần cứng nhưng không gửi được (bridge không kết nối)
-#   "unsupported" = chưa nối phần cứng thật
-def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> str:
-    if room in ("kitchen", "bedroom") and device in ("fan", "led"):
-        cmd = f"{device.upper()}_{'ON' if is_on else 'OFF'}"      # FAN_ON, FAN_OFF, LED_ON, LED_OFF
-        return "ok" if send_command(room, cmd, force=True) else "failed"
-    if room == "living_room" and device == "door":
-        # Quy ước: ON = mở khoá, OFF = khoá lại
-        # Servo quay mất ~0.6 s nên chạy trong thread riêng, không chặn luồng MQTT
-        if is_on:
-            threading.Thread(target=living_room.unlock_door, kwargs={"source": "app"}, daemon=True).start()
-        else:
-            threading.Thread(target=living_room.lock_door, daemon=True).start()
-        return "ok"
-    if room == "living_room" and device == "fan":
-        living_room.set_fan(is_on, source="app")
-        return "ok"
-    if room == "living_room" and device == "led":
-        living_room.set_led(is_on, source="app")
-        return "ok"
-    return "unsupported"
-
-
-# Nhận ngưỡng gas từ app và chuyển xuống node kitchen qua bridge.
-# Trả về (ok, message): MQTT bỏ qua giá trị trả về, Firestore dùng để ghi status done/failed.
-def _handle_gas_threshold_command(raw_value: str):
-    try:
-        th = int(float(raw_value.strip()))
-    except (ValueError, OverflowError):   # OverflowError: payload như "inf" hoặc "1e999"
-        msg = (f"Ngưỡng gas không hợp lệ: '{raw_value}' (cần số nguyên "
-               f"{GAS_THRESHOLD_MIN}..{GAS_THRESHOLD_MAX}).")
-        _notify_gateway_error(msg)
-        return False, msg
-
-    if not GAS_THRESHOLD_MIN <= th <= GAS_THRESHOLD_MAX:
-        msg = f"Ngưỡng gas {th} ngoài khoảng {GAS_THRESHOLD_MIN}..{GAS_THRESHOLD_MAX}."
-        _notify_gateway_error(msg)
-        return False, msg
-
-    if not send_command("kitchen", f"GAS_TH={th}", force=True):
-        msg = f"Không gửi được ngưỡng gas {th}: bridge chưa kết nối."
-        _notify_gateway_error(msg)
-        return False, msg
-
-    # KHÔNG publish state ở đây: chờ node kitchen báo lại trong telemetry (xem parse_data),
-    # để app luôn thấy giá trị node thật sự đang dùng.
-    print(f"[CMD] Đã gửi ngưỡng gas {th} xuống kitchen, chờ node xác nhận.")
-    return True, f"Đã gửi ngưỡng gas {th}, chờ node xác nhận."
-
-
-# Xử lý lệnh app publish vào smarthome/<room>/<device>/set (hoặc lệnh từ Firestore).
-# Trả về (ok, message).
-def _handle_app_command(room: str, device: str, raw_value: str):
-    # Ngưỡng gas là số, không phải ON/OFF nên xử lý riêng
-    if (room, device) == ("kitchen", "gas_threshold"):
-        return _handle_gas_threshold_command(raw_value)
-
-    value = _normalize_switch_payload(raw_value)
-    if value is None:
-        msg = f"Giá trị lệnh không hợp lệ: {room}/{device} = {raw_value}"
-        print(f"[WARN] {msg}")
-        return False, msg
-
-    result = _dispatch_hardware_command(room, device, value == "ON")
-
-    # Lệnh không tới được phần cứng: báo lỗi cho app, KHÔNG xác nhận trạng thái giả
-    if result == "failed":
-        msg = f"Không gửi được lệnh {room}/{device} = {value}: bridge chưa kết nối."
-        _notify_gateway_error(msg)
-        return False, msg
-
-    _device_states[(room, device)] = value
-    _publish_device_state(room, device, value)
-
-    print(f"🎮 Nhận lệnh: {ROOT_TOPIC}/{room}/{device}/set = {value}  →  "
-          f"đã cập nhật {ROOT_TOPIC}/{room}/{device}/state")
-    if result == "unsupported":
-        print(f"    (lưu ý: {room}/{device} chưa nối phần cứng thật, chỉ echo trạng thái cho app)")
-        return True, "Chưa nối phần cứng thật, chỉ cập nhật trạng thái"
-    return True, "ok"
-
-
-# ==========================================
-# FIREBASE (FIRESTORE)
-# ==========================================
-# Lệnh từ collection "commands": chỉ chấp nhận đúng các thiết bị điều khiển được
-def _firebase_command_handler(room: str, device: str, value: str):
-    if (room, device) not in CONTROLLABLE_DEVICES:
-        return False, f"Thiết bị không được hỗ trợ: {room}/{device}"
-    return _handle_app_command(room, device, value)
-
-
-# Ảnh chụp trạng thái toàn nhà để ghi vào state/<gateway_id>
-def _firebase_state_snapshot() -> dict:
-    lr = living_room.state
-    return {
-        "kitchen": {
-            "temp": state["kit_temp"],
-            "humid": state["kit_humid"],
-            "gas_raw": state["kit_gas_raw"],
-            "gas_voltage": state["kit_gas_voltage"],
-            "gas_threshold": state["kit_gas_threshold"],
-            "fan": state["kit_fan"],
-            "led": state["kit_led"],
-            "alarm": state["kit_alarm"],
-        },
-        "bedroom": {
-            "temp": state["bed_temp"],
-            "humid": state["bed_humid"],
-            "light": state["bed_light"],
-            "motion": state["bed_motion"],
-            "fan": state["bed_fan"],
-            "led": state["bed_led"],
-            "alarm_level": state["bed_alarm_level"],
-        },
-        "living_room": {
-            "temp": lr.get("temp"),
-            "humid": lr.get("humid"),
-            "motion": lr.get("motion"),
-            "door_open": lr.get("door_open"),
-            "door_locked": lr.get("door_locked"),
-            "yolo_people_count": int(lr.get("yolo_people_count") or 0),
-        },
-        "fire_gas": {
-            "level": state["fire_gas_level"],
-            "context": state["fire_gas_context"],
-            "reason": state["fire_gas_reason"],
-        },
-        "bridge": {"online": bool(_bridge_online), "error": _bridge_error},
-        "devices": {f"{r}_{d}": v for (r, d), v in _device_states.items()},
-    }
-
-
-fb = FirebaseBridge(
-    gateway_id=FIREBASE_GATEWAY_ID,
-    command_handler=_firebase_command_handler,
-    fcm_topic=FIREBASE_FCM_TOPIC,
-)
-
-_LEVEL_TITLE = {
-    "MED": "Cảnh báo gas/cháy",
-    "MAX": "NGUY HIỂM: gas/cháy",
-    "RED": "KHẨN CẤP: gas/cháy",
-}
-
-
-# Ghi sự kiện + thông báo khi báo động gas/cháy đổi (context, level)
-def _notify_fire_gas_firebase(context: str, level: str):
-    severity = "critical" if level in ("MAX", "RED") else "warning"
-    payload = {**_alarm_details(), "level": level, "context": context}
-    fb.add_event("fire_gas", payload, level=severity)
-    fb.add_notification(
-        _LEVEL_TITLE.get(level, "Cảnh báo gas/cháy"),
-        f"Nguyên nhân: {state['fire_gas_reason']} (tình huống: {context})",
-        level=severity,
-        event_type="fire_gas",
-    )
-
-
-def _on_living_room_event(event_type: str, payload: dict):
-    if event_type == "door_status":
-        _publish(TOPIC_DOOR_STATUS, payload, retain=True)
-        _publish_door_state_to_app()      # cập nhật nút cửa trên app theo trạng thái thật
-        fb.add_event("door_status", payload)
-    elif event_type == "alarm":
-        _publish(TOPIC_ALARM, payload)
-        fb.add_event("alarm", payload, level="warning")
-    elif event_type == "fire_gas":
-        _publish(TOPIC_FIRE_GAS, payload, retain=True)
-        # Sự kiện fire_gas cho Firebase đã được ghi ở _set_fire_gas_alarm (chỉ khi đổi mức)
-    elif event_type == "sensor_reading":
-        safe_append_log({"ts": datetime.now().strftime("%H:%M:%S"), "node": "living_room", **payload})
-    elif event_type == "device_state":
-        # Nút nhấn vật lý đổi trạng thái đèn/quạt phòng khách: đồng bộ lên app
-        dev = payload.get("device")
-        if dev in ("led", "fan"):
-            value = "ON" if payload.get("on") else "OFF"
-            _device_states[("living_room", dev)] = value
-            _publish_device_state("living_room", dev, value)
-
-
-def _on_mqtt_connect(client, userdata, flags, rc, properties=None):
-    print(f"[MQTT] Gateway đã kết nối HiveMQ, rc={rc}")
-    client.subscribe(TOPIC_DOOR_CMD)
-    client.subscribe(TOPIC_FACE_UNLOCK)
-    client.subscribe(TOPIC_FIRE_GAS_ACK)
-    for topic in TOPIC_APP_CMD_SET:
-        client.subscribe(topic)
-    client.publish(TOPIC_HOUSE_STATUS, "online", qos=1, retain=True)
-    _publish_bridge_state()   # bridge có thể đã lỗi từ trước khi MQTT kết nối xong
-
-
-def _on_mqtt_message(client, userdata, msg):
-    if msg.topic in TOPIC_APP_CMD_SET:
-        room, device = TOPIC_APP_CMD_SET[msg.topic]
-        raw_value = msg.payload.decode("utf-8", errors="replace")
-        _handle_app_command(room, device, raw_value)
-        return
-
-    payload = msg.payload.decode("utf-8", errors="replace").strip().upper()
-    print(f"[MQTT] {msg.topic}: {payload}")
-
-    if msg.topic == TOPIC_DOOR_CMD:
-        if payload in ("OPEN", "UNLOCK"):
-            threading.Thread(target=living_room.unlock_door, kwargs={"source": "app"}, daemon=True).start()
-        elif payload in ("CLOSE", "LOCK"):
-            threading.Thread(target=living_room.lock_door, daemon=True).start()
-        else:
-            print(f"[WARN] Lệnh cửa không hợp lệ: {payload}")
-
-    elif msg.topic == TOPIC_FACE_UNLOCK:
-        if payload in ("OK", "UNLOCK", "SUCCESS"):
-            threading.Thread(target=living_room.unlock_door, kwargs={"source": "face"}, daemon=True).start()
-
-    elif msg.topic == TOPIC_FIRE_GAS_ACK:
-        if payload in ("ACK", "OK", "HANDLED", "CLEAR"):
-            ack_fire_gas()
-
-
-# Tương thích paho-mqtt 1.x và 2.x, tự reconnect, có LWT
-def setup_mqtt():
-    global _mqtt_client
-    if not MQTT_PASSWORD:
-        print("[WARN] MQTT_PASSWORD chưa được đặt (export MQTT_PASSWORD='...'), kết nối HiveMQ sẽ thất bại.")
-
-    if hasattr(mqtt, "CallbackAPIVersion"):
-        _mqtt_client = mqtt.Client(
-            client_id=MQTT_CLIENT_ID,
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        i2c_bus = smbus2.SMBus(I2C_BUS)
+    except PermissionError:
+        i2c_bus = None
+        print(
+            f"[WARN] Không có quyền mở /dev/i2c-{I2C_BUS}. "
+            f"User hiện tại: {os.getenv('USER', 'unknown')}. "
+            "BH1750/lux sẽ tạm bị bỏ qua, các chức năng gas/cửa/còi vẫn chạy."
         )
+    except FileNotFoundError:
+        i2c_bus = None
+        print(f"[WARN] Không tìm thấy /dev/i2c-{I2C_BUS}. Kiểm tra đã bật I2C trên máy chưa.")
+
+    # PIR không dùng ngắt nữa: _pir_loop() lấy mẫu mỗi 20 ms và chạy bộ lọc giống bedroom.
+    GPIO.add_event_detect(REED_PIN, GPIO.BOTH, callback=_on_door_state_change, bouncetime=200)
+
+
+# ==========================================
+# QUẠT
+# ==========================================
+
+# điều khiển mở quạt từ từ để tránh sụt áp (INA=LOW, INB=PWM)
+_fan_duty = 0.0   # duty PWM hiện tại của quạt (%)
+
+
+def _fan_ramp(start, target):
+    """Tăng/giảm duty từ start tới target trong FAN_RAMP_TIME (tránh sụt áp khi khởi động quạt)."""
+    global _fan_duty
+    step_delay = FAN_RAMP_TIME / FAN_RAMP_STEPS
+    for i in range(1, FAN_RAMP_STEPS + 1):
+        if _fan_ramp_stop.is_set():
+            return                      # bị ngắt (vd fan_off được gọi giữa chừng)
+        _fan_duty = start + (target - start) * i / FAN_RAMP_STEPS
+        _fan_pwm.ChangeDutyCycle(_fan_duty)
+        time.sleep(step_delay)
+
+
+_fan_lock = threading.RLock() # tránh nhiều luồng cùng bật/tắt quạt một lúc
+
+def fan_set_level(level: int):
+    """Đặt mức quạt 0..3 (0 = tắt). Đổi mức khi đang chạy thì chuyển mượt từ duty hiện tại."""
+    global _fan_ramp_thread, _fan_duty
+    level = max(0, min(3, int(level)))
+    with _fan_lock:
+        if level == 0:
+            fan_off()
+            return
+        if state["fan"] and state["fan_level"] == level:
+            return                      # đang chạy đúng mức rồi, không ramp lại
+        _fan_ramp_stop.set()            # dừng ramp cũ (nếu có)
+        if _fan_ramp_thread is not None:
+            _fan_ramp_thread.join()
+        GPIO.output(FAN_INA_PIN, GPIO.LOW)
+        _fan_ramp_stop.clear()
+        start = _fan_duty if state["fan"] else 0.0
+        _fan_ramp_thread = threading.Thread(target=_fan_ramp, args=(start, FAN_LEVEL_DUTY[level]),
+                                            daemon=True)
+        _fan_ramp_thread.start()
+        state["fan"] = True
+        state["fan_level"] = level
+
+
+def fan_on(level: int = FAN_AUTO_LEVEL):
+    fan_set_level(level)
+
+
+def fan_off():
+    global _fan_duty
+    with _fan_lock:
+        _fan_ramp_stop.set()            # dừng ramp đang chạy (nếu có)
+        if _fan_ramp_thread is not None:
+            _fan_ramp_thread.join()
+        GPIO.output(FAN_INA_PIN, GPIO.LOW)
+        _fan_pwm.ChangeDutyCycle(0)
+        _fan_duty = 0.0
+        state["fan"] = False
+        state["fan_level"] = 0
+
+
+def set_fan(on: bool, source: str = "app"):
+    """Bật/tắt quạt thủ công từ app (công tắc ON/OFF): quạt chuyển sang MANUAL.
+    Bật lại thì dùng mức gần nhất người dùng đã chọn."""
+    fan_set_level(_last_fan_level if on else 0)
+    _app_manual["fan"] = True
+    print(f"[LIVING ROOM] Quạt điều khiển thủ công bởi {source}: {'ON' if on else 'OFF'} (MANUAL)")
+
+
+def set_fan_level_manual(level: int, source: str = "app"):
+    """Chọn mức quạt 0..3 từ app (fan_level/set): quạt chuyển sang MANUAL."""
+    global _last_fan_level
+    level = max(0, min(3, int(level)))
+    if level > 0:
+        _last_fan_level = level
+    fan_set_level(level)
+    _app_manual["fan"] = True
+    print(f"[LIVING ROOM] Mức quạt {level} ({FAN_LEVEL_DUTY[level]}%) bởi {source} (MANUAL)")
+
+
+# ==========================================
+# ĐÈN (bật khi tối + có người)
+# ==========================================
+def led_on():
+    GPIO.output(LED_PIN, GPIO.HIGH)
+    state["led"] = True
+
+
+def led_off():
+    GPIO.output(LED_PIN, GPIO.LOW)
+    state["led"] = False
+
+
+def set_led(on: bool, source: str = "app"):
+    """Bật/tắt đèn thủ công từ app: đèn chuyển sang MANUAL (quạt không bị ảnh hưởng)."""
+    if on:
+        led_on()
     else:
-        _mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID)
-
-    _mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-    _mqtt_client.tls_set()
-    _mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
-    _mqtt_client.will_set(TOPIC_HOUSE_STATUS, "offline", qos=1, retain=True)
-    _mqtt_client.on_connect = _on_mqtt_connect
-    _mqtt_client.on_message = _on_mqtt_message
-    _mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
-    _mqtt_client.loop_start()
+        led_off()
+    _app_manual["led"] = True
+    print(f"[LIVING ROOM] Đèn điều khiển thủ công bởi {source}: {'ON' if on else 'OFF'} (MANUAL)")
 
 
-# Đúng thứ tự: publish offline -> disconnect -> loop_stop
-def cleanup_mqtt():
-    global _mqtt_client
-    if _mqtt_client is None:
-        return
-    try:
-        info = _mqtt_client.publish(TOPIC_HOUSE_STATUS, "offline", qos=1, retain=True)
-        info.wait_for_publish(timeout=2)
-    except Exception:
-        pass
-    try:
-        _mqtt_client.disconnect()
-        _mqtt_client.loop_stop()
-        print("[INFO] Đã ngắt HiveMQ ở gateway.")
-    except Exception:
-        pass
-    _mqtt_client = None
+def get_mode(device: str) -> str:
+    """'MANUAL' nếu thiết bị đang do người dùng quyết định (app hoặc nút vật lý), ngược lại 'AUTO'."""
+    return "MANUAL" if (_app_manual[device] or _btn_override[device]) else "AUTO"
 
 
-# ==========================================
-# BRIDGE (CỔNG SERIAL): MỞ / MẤT KẾT NỐI / BÁO LỖI CHO APP
-# ==========================================
-def _notify_gateway_error(message: str):
-    """Báo lỗi tức thời cho app (không retained: chỉ app đang mở mới nhận)."""
-    print(f"[ERROR] {message}")
-    _publish_raw(TOPIC_GATEWAY_ERROR, message, qos=1)
-
-
-def _publish_bridge_state():
-    """Gửi trạng thái bridge cho app. Retained để app mở lên sau vẫn thấy trạng thái hiện tại."""
-    if _bridge_online is None:
-        return
-    _publish_raw(TOPIC_BRIDGE_STATE, "ONLINE" if _bridge_online else "OFFLINE", qos=1, retain=True)
-    # Payload rỗng + retained = xoá thông báo lỗi cũ khi bridge đã hoạt động lại
-    _publish_raw(TOPIC_BRIDGE_ERROR, "" if _bridge_online else _bridge_error, qos=1, retain=True)
-
-
-def _set_bridge_state(online: bool, reason: str = ""):
-    """Đổi trạng thái bridge; chỉ log/publish khi có thay đổi (tránh lặp mỗi lần thử lại)."""
-    global _bridge_online, _bridge_error
-    if _bridge_online == online and _bridge_error == reason:
-        return
-    _bridge_online = online
-    _bridge_error = reason
-    if online:
-        print(f"[BRIDGE] Đã kết nối {PORT} @ {BAUD_RATE} baud.")
+def set_mode(device: str, mode: str, source: str = "app"):
+    """Đổi chế độ 1 thiết bị (led/fan) từ app.
+    MANUAL: giữ nguyên trạng thái hiện tại, chỉ không cho tự động đổi nữa.
+    AUTO  : bỏ mọi ghi đè của thiết bị đó, vòng điều khiển đánh giá lại ngay theo cảm biến."""
+    global _force_eval
+    if device not in ("led", "fan") or mode not in ("AUTO", "MANUAL"):
+        raise ValueError(f"set_mode: {device}={mode}")
+    if mode == "MANUAL":
+        _app_manual[device] = True
     else:
-        print(f"[BRIDGE][ERROR] {reason}")
-    _publish_bridge_state()
-
-    # Firebase: cập nhật gateways/<id>, ghi sự kiện, và thông báo khi mất bridge
-    fb.update_gateway(bridge_online=online, bridge_error=reason)
-    if online:
-        fb.add_event("bridge_online", {"port": PORT})
-    else:
-        fb.add_event("bridge_offline", {"reason": reason}, level="warning")
-        fb.add_notification("Mất kết nối bridge", reason, level="warning", event_type="bridge_offline")
+        _app_manual[device] = False
+        _btn_override[device] = False
+        _force_eval = True
+    print(f"[LIVING ROOM] {device} -> {mode} bởi {source}")
 
 
-def _open_serial() -> bool:
-    """Thử mở cổng serial. Lỗi thì KHÔNG thoát gateway, chỉ báo cho app và để vòng lặp thử lại."""
-    global ser
-    try:
-        port = serial.Serial(PORT, BAUD_RATE, timeout=1)
-    except (serial.SerialException, OSError) as e:
-        ser = None
-        _set_bridge_state(False, f"Không kết nối được bridge ({PORT}): {e}. {_BRIDGE_IMPACT}")
-        return False
-
-    time.sleep(2)   # chờ ESP32 reset sau khi mở cổng
-    try:
-        port.reset_input_buffer()
-    except (serial.SerialException, OSError):
-        pass
-    ser = port
-    _set_bridge_state(True)
-    return True
-
-
-def _handle_bridge_lost(err):
-    """Bridge bị rút / lỗi I/O khi đang chạy: đóng cổng, báo app, vòng lặp chính sẽ tự thử lại."""
-    global ser
-    port, ser = ser, None
-    if port is not None:
-        try:
-            port.close()
-        except Exception:
-            pass
-    _set_bridge_state(False, f"Mất kết nối bridge ({PORT}): {err}. {_BRIDGE_IMPACT}")
+def set_auto(source: str = "app"):
+    """Tương đương lệnh AUTO / ALARM_OFF bên C: đưa CẢ đèn và quạt về AUTO, tắt còi/đèn/quạt.
+    Đang báo cháy/gas thì không tắt thiết bị (giữ điểm an toàn riêng của Python)."""
+    global _force_eval
+    _app_manual["led"] = _app_manual["fan"] = False
+    _btn_override["led"] = False
+    _btn_override["fan"] = False
+    _force_eval = True
+    if not state["fire_gas_alarm"]:
+        GPIO.output(BUZZER_PIN, GPIO.LOW)
+        fan_off()
+        led_off()
+    print(f"[LIVING ROOM] Về chế độ AUTO bởi {source}")
 
 
 # ==========================================
-# LỆNH ĐIỀU KHIỂN QUA BRIDGE
+# SERVO SG90 - KHOÁ CỬA
 # ==========================================
-def send_command(target: str, cmd: str, force: bool = False) -> bool:
-    """Gửi lệnh xuống node qua bridge.
-    True  = đã gửi (hoặc bỏ qua vì vừa gửi đúng lệnh này gần đây).
-    False = không gửi được (lệnh sai, hoặc bridge không kết nối)."""
-    allowed_targets = {"kitchen", "bedroom", "all"}
-    allowed_cmds = {
-        "FAN_ON", "FAN_OFF", "LED_ON", "LED_OFF",
-        "ALERT_ON", "ALERT_OFF",
-        "ALARM_MED", "ALARM_MAX", "ALARM_OFF",
-        "ON", "OFF", "AUTO",
-    }
-    target = target.strip().lower()
-    cmd = cmd.strip().upper()
-
-    # Lệnh đặt ngưỡng gas: GAS_TH=<GAS_THRESHOLD_MIN..GAS_THRESHOLD_MAX>, chỉ dành cho kitchen
-    gas_match = _GAS_TH_RE.match(cmd)
-    valid_gas_cmd = bool(
-        gas_match
-        and target == "kitchen"
-        and GAS_THRESHOLD_MIN <= int(gas_match.group(1)) <= GAS_THRESHOLD_MAX
-    )
-
-    if target not in allowed_targets or not (cmd in allowed_cmds or valid_gas_cmd):
-        print(f"[WARN] Lệnh không hợp lệ: {target}:{cmd}")
-        return False
-
-    now = time.time()
-    key = (target, cmd)
-    if not force and now - _last_command.get(key, 0.0) < COMMAND_REPEAT_SEC:
-        return True
-
-    port = ser
-    if port is None or not port.is_open:
-        # Lệnh tự động (báo cháy...) im lặng bỏ qua để không spam log; trạng thái bridge đã được báo riêng
-        if force:
-            print(f"[WARN] Bridge chưa kết nối, bỏ qua lệnh: {target}:{cmd}")
-        return False
-
-    try:
-        port.write((f"{target}:{cmd}\n").encode("utf-8"))
-    except (serial.SerialException, OSError) as e:
-        _handle_bridge_lost(e)
-        return False
-
-    _last_command[key] = now
-    print(f"[CMD] Đã gửi: {target}:{cmd}")
-    return True
+def limit_servo_angle(angle):
+    return max(0, min(180, angle))
 
 
-def ack_fire_gas():
-    global _manual_ack_ts
-    _manual_ack_ts = time.time()
-    print("[INFO] Đã ghi nhận người dùng xác nhận xử lý cảnh báo gas/cháy.")
+def _angle_to_duty(angle: float) -> float:
+    angle = limit_servo_angle(angle)
+    return SERVO_MIN_DUTY + (angle / 180.0) * (SERVO_MAX_DUTY - SERVO_MIN_DUTY)
 
 
-# ==========================================
-# NGỮ CẢNH HIỆN DIỆN / NHIỆT ĐỘ
-# ==========================================
-def _remember_kitchen_temp(temp):
-    if temp is None:
+def _set_servo_angle(angle: float):
+    if _servo_pwm is None:
         return
-    now = time.time()
-    _kit_temp_history.append((now, temp))
-    while _kit_temp_history and now - _kit_temp_history[0][0] > TEMP_RISE_WINDOW_SEC:
-        _kit_temp_history.pop(0)
+    with _servo_lock:
+        _servo_pwm.ChangeDutyCycle(_angle_to_duty(angle))
+        time.sleep(SERVO_MOVE_SEC)
+        _servo_pwm.ChangeDutyCycle(0)   # nhả xung để servo không giật/nóng
 
 
-def _kitchen_temp_delta():
-    if len(_kit_temp_history) < 2:
-        return 0.0
-    return _kit_temp_history[-1][1] - _kit_temp_history[0][1]
-
-def _is_night():
-    hour = datetime.now().hour
-    return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
-
-## Cập nhật thời điểm cuối cùng có người hiện diện trong nhà (motion PIR hoặc YOLO)
-def _update_presence():
-    global _last_presence_ts
-    lr = living_room.state
-    yolo_people = int(lr.get("yolo_people_count") or 0)
-    present = (
-        bool(state["bed_motion"]) or
-        bool(lr.get("motion")) or
-        yolo_people > 0
-    )
-    if present:
-        _last_presence_ts = time.time()
-    return present
+def lock_door():
+    global _unlock_generation
+    _unlock_generation += 1            # huỷ mọi luồng auto-relock đang chờ
+    _set_servo_angle(SERVO_LOCK_ANGLE)
+    state["door_locked"] = True
+    print("[DOOR] Đã khoá cửa.")
+    _emit_door_status()
 
 
-def _is_unoccupied():
-    _update_presence()
-    return time.time() - _last_presence_ts >= UNOCCUPIED_AFTER_SEC
+def unlock_door(source: str = "app", auto_relock: bool = True):
+    """Mở khoá cửa.
+    auto_relock=True : tự khoá lại sau AUTO_LOCK_AFTER_SEC giây (app/face).
+    auto_relock=False: giữ mở (thoát hiểm khi cháy/gas).
+    """
+    global _last_authorized_unlock_ts, _unlock_generation
+    _unlock_generation += 1
+    my_generation = _unlock_generation
 
+    _set_servo_angle(SERVO_UNLOCK_ANGLE)
+    state["door_locked"] = False
+    _last_authorized_unlock_ts = time.time()
+    print(f"[DOOR] Mở khoá bởi: {source} (auto_relock={auto_relock})")
+    _emit_door_status()
 
-def _danger_detected():
-    return bool(_danger_reasons())
-
-
-# Hàm trả về danh sách lý do cảnh báo gas/cháy, để app hiển thị cho người dùng
-def _danger_reasons():
-    gas_threshold = state.get("kit_gas_threshold")
-    gas_raw = state["kit_gas_raw"]
-    temp = state["kit_temp"]
-    temp_delta = _kitchen_temp_delta()
-
-    reasons = []
-
-    # Báo gas chỉ so gas_raw với ngưỡng node kitchen đang dùng.
-    # Chưa biết ngưỡng (node chưa báo) thì không so sánh với None.
-    if gas_raw is not None and gas_threshold is not None and gas_raw >= gas_threshold:
-        reasons.append("gas")
-
-    if temp is not None and temp >= TEMP_FIRE_THRESHOLD:
-        reasons.append("high_temp")
-    if temp_delta >= TEMP_RISE_THRESHOLD:
-        reasons.append("temp_rise")
-    return reasons
-
-
-def _alarm_details():
-    return {
-        "kit_temp": state["kit_temp"],
-        "kit_humid": state["kit_humid"],
-        "kit_gas_raw": state["kit_gas_raw"],
-        "kit_gas_voltage": state["kit_gas_voltage"],
-        "kit_gas_threshold": state["kit_gas_threshold"],
-        "delta_t_10s": round(_kitchen_temp_delta(), 2),
-        "reason": state["fire_gas_reason"],
-        "bed_motion": state["bed_motion"],
-        "living_motion": bool(living_room.state.get("motion")),
-        "yolo_people_count": int(living_room.state.get("yolo_people_count") or 0),
-    }
-
-
-def _set_fire_gas_alarm(context: str, level: str, unlock: bool = False):
-    global _unlock_sent, _last_fb_alarm
-    state["fire_gas_context"] = context
-    state["fire_gas_level"] = level
-    state["fire_gas_reason"] = ",".join(_danger_reasons())
-
-    _publish_gas_alert(True)
-
-    # Firebase: chỉ ghi khi đổi (context, level), không ghi lặp mỗi giây
-    if (context, level) != _last_fb_alarm:
-        _last_fb_alarm = (context, level)
-        _notify_fire_gas_firebase(context, level)
-
-    print(f"[FIRE/GAS] {state['fire_gas_reason']} -> {context}/{level}: gửi lệnh về các node")
-    send_command("kitchen", "ALERT_ON")
-    # Còi phòng ngủ luôn kêu mạnh nhất khi có báo động, bất kể mức MED/MAX/RED
-    send_command("bedroom", "ALARM_MAX")
-
-    # Phòng khách: bật đèn/quạt (không dùng còi)
-    living_room.trigger_fire_gas_alarm(level, context, _alarm_details())
-
-    if unlock and not _unlock_sent:
-        # auto_relock=False: giữ cửa mở làm lối thoát hiểm, không tự khoá lại sau vài giây
-        threading.Thread(
-            target=living_room.unlock_door,
-            kwargs={"source": f"fire_gas_{context}", "auto_relock": False},
-            daemon=True,
-        ).start()
-        _unlock_sent = True
-
-
-def _send_alarm_off_repeated():
-    """Gửi lệnh tắt còi: lần đầu ngay lập tức, các lần sau trong thread riêng
-    (ESP-NOW không có xác nhận nên gửi lặp để tránh mất gói, còi không kêu mãi)."""
-    send_command("kitchen", "ALERT_OFF", force=True)
-    send_command("bedroom", "ALARM_OFF", force=True)
-
-    def _worker():
-        for _ in range(ALARM_OFF_REPEAT - 1):
-            time.sleep(ALARM_OFF_REPEAT_GAP_SEC)
-            send_command("kitchen", "ALERT_OFF", force=True)
-            send_command("bedroom", "ALARM_OFF", force=True)
-
-    if ALARM_OFF_REPEAT > 1:
-        threading.Thread(target=_worker, daemon=True).start()
-
-
-def _clear_fire_gas_alarm():
-    global _danger_started_ts, _day_escalated, _unlock_sent, _last_fb_alarm, _safe_since
-    if state["fire_gas_level"] != "CLEAR":
-        _send_alarm_off_repeated()
-        living_room.clear_fire_gas_alarm()
-        print("[INFO] Cảnh báo gas/cháy đã về CLEAR.")
-
-        fb.add_event("fire_gas_clear", {"previous_level": state["fire_gas_level"]})
-        fb.add_notification(
-            "Đã hết cảnh báo gas/cháy",
-            "Trạng thái trở về bình thường.",
-            level="info",
-            event_type="fire_gas_clear",
-        )
-
-        # Hết báo động thì khoá cửa lại (nếu lúc báo động đã mở cửa thoát hiểm
-        # và cửa đang đóng hẳn; nếu cửa còn mở thì để nguyên, người dùng tự khoá qua app)
-        if _unlock_sent and not living_room.state["door_open"]:
-            threading.Thread(target=living_room.lock_door, daemon=True).start()
-
-    _publish_gas_alert(False)
-
-    state["fire_gas_context"] = "clear"
-    state["fire_gas_level"] = "CLEAR"
-    state["fire_gas_reason"] = "none"
-    _danger_started_ts = None
-    _safe_since = None
-    _day_escalated = False
-    _unlock_sent = False
-    _last_fb_alarm = None
-
-
-def evaluate_fire_gas_context():
-    global _danger_started_ts, _day_escalated, _safe_since
-
-    # Chưa có bridge thì không có dữ liệu bếp/phòng ngủ để đánh giá. Nếu đang KHÔNG báo động
-    # thì bỏ qua (tránh báo "gas an toàn" giả lên app). Nếu ĐANG báo động thì vẫn đánh giá tiếp
-    # để giữ nguyên báo động (an toàn hơn là tự tắt khi không còn dữ liệu).
-    if not _bridge_online and state["fire_gas_level"] == "CLEAR":
+    if not auto_relock:
         return
 
-    now = time.time()
-    if not _danger_detected():
-        if state["fire_gas_level"] != "CLEAR":
-            # Đang báo động: phải hết nguy hiểm liên tục CLEAR_HOLD_SEC mới tắt
-            if _safe_since is None:
-                _safe_since = now
-            if now - _safe_since < CLEAR_HOLD_SEC:
-                return
-        _safe_since = None
-        _clear_fire_gas_alarm()
-        return
+    def _auto_relock():
+        time.sleep(AUTO_LOCK_AFTER_SEC)
 
-    _safe_since = None   # nguy hiểm quay lại: huỷ bộ đếm giữ báo động
+        # Cửa vẫn đang mở thì chờ đóng lại rồi mới khoá (tránh chốt kẹt vào khung)
+        waited = 0.0
+        while state["door_open"] and waited < DOOR_OPEN_WAIT_MAX:
+            time.sleep(0.5)
+            waited += 0.5
 
-    if _manual_ack_ts and _danger_started_ts and _manual_ack_ts >= _danger_started_ts:
-        _set_fire_gas_alarm("acknowledged", "MED")
-        return
+        # Chỉ khoá nếu không có lệnh mới hơn và không đang báo cháy/gas
+        if (
+            my_generation == _unlock_generation
+            and not state["door_locked"]
+            and not state["fire_gas_alarm"]
+        ):
+            lock_door()
 
-    if _danger_started_ts is None:
-        _danger_started_ts = now
-        _day_escalated = False
-
-    danger_age = now - _danger_started_ts
-
-    if _is_unoccupied():
-        _set_fire_gas_alarm("unoccupied", "RED", unlock=True)
-        return
-
-    if _is_night() and state["bed_motion"]:
-        _set_fire_gas_alarm(
-            "night_sleeping",
-            "MAX",
-            unlock=danger_age >= NIGHT_UNLOCK_AFTER_SEC,
-        )
-        return
-
-    if danger_age >= DAY_ESCALATE_AFTER_SEC:
-        _day_escalated = True
-
-    if _day_escalated:
-        _set_fire_gas_alarm("day_occupied_escalated", "MAX", unlock=True)
-    else:
-        _set_fire_gas_alarm("day_occupied", "MED")
+    threading.Thread(target=_auto_relock, daemon=True).start()
 
 
 # ==========================================
-# PARSE DỮ LIỆU JSON TỪ BRIDGE
+# CẢM BIẾN TỪ CỬA (REED)
 # ==========================================
-def parse_data(line: str) -> bool:
-    line = line.strip()
-    if not line.startswith("{"):
-        return False
+def _apply_door_state(is_open: bool):
+    if state["door_open"] == is_open:
+        return
 
-    try:
-        data = json.loads(line)
-    except json.JSONDecodeError:
-        print(f"[WARN] JSON lỗi: {line}")
-        return False
-
-    if "error" in data:
-        print(f"[ERROR] Bridge: {data['error']}")
-        return False
-
-    if "bridge_mac" in data:
-        print(f"[INFO] Bridge MAC: {data['bridge_mac']}")
-        return False
-
-    node = data.get("node")
+    state["door_open"] = is_open
     ts = datetime.now().strftime("%H:%M:%S")
-
-    if node == "kitchen":
-        kit_temp = data.get("temp")
-        kit_humid = data.get("humid")
-        kit_gas_raw = data.get("gas_raw")
-        kit_gas_voltage = data.get("gas_voltage", data.get("gas"))   # tuỳ chọn, chỉ để hiển thị
-
-        # Chỉ gas_raw là bắt buộc: báo gas chỉ dựa vào nó.
-        # DHT (temp/humid) lỗi thì KHÔNG được làm mất cảnh báo gas.
-        if kit_gas_raw is None:
-            print(f"[WARN] Kitchen thiếu gas_raw: {data}")
-            return False
-
-        if kit_temp is None or kit_humid is None:
-            print("[WARN] Kitchen DHT đọc lỗi tạm thời, giữ nguyên nhiệt độ/độ ẩm trước đó.")
-        else:
-            state["kit_temp"] = round(float(kit_temp), 1)
-            state["kit_humid"] = round(float(kit_humid), 1)
-            _remember_kitchen_temp(state["kit_temp"])
-
-        state["kit_gas_raw"] = int(kit_gas_raw)
-        state["kit_gas_voltage"] = round(float(kit_gas_voltage), 3) if kit_gas_voltage is not None else None
-        state["kit_fan"] = bool(data.get("fan", False))
-        state["kit_led"] = bool(data.get("led", False))
-        state["kit_alarm"] = bool(data.get("alarm", False))
-
-        # Ngưỡng là field tuỳ chọn: firmware cũ chưa gửi thì giữ giá trị trước đó, không crash
-        th_raw = data.get("gas_threshold")
-        if th_raw is not None:
-            try:
-                state["kit_gas_threshold"] = int(th_raw)
-                _publish_gas_threshold_state_to_app()   # app thấy đúng giá trị node đang dùng
-            except (TypeError, ValueError):
-                print(f"[WARN] Kitchen gas_threshold không hợp lệ: {th_raw!r}")
-
-        _update_presence()
-
-        print(f"[{ts}] KITCHEN | "
-              f"Nhiệt độ: {state['kit_temp']}°C  "
-              f"Độ ẩm: {state['kit_humid']}%  "
-              f"Gas: raw={state['kit_gas_raw']} / {state['kit_gas_voltage']}V  "
-              f"Ngưỡng: {state['kit_gas_threshold']}")
-
-        safe_append_log({"ts": ts, "node": "kitchen", **{
-            "temp": state["kit_temp"],
-            "humid": state["kit_humid"],
-            "gas_raw": state["kit_gas_raw"],
-            "gas_voltage": state["kit_gas_voltage"],
-            "gas_threshold": state["kit_gas_threshold"],
-        }})
-        evaluate_fire_gas_context()
-        return True
-
-    if node == "bedroom":
-        bed_temp = data.get("temp")
-        bed_humid = data.get("humid")
-        bed_light = data.get("light")
-
-        if bed_light is None:
-            print(f"[WARN] Bedroom thiếu field ánh sáng: {data}")
-            return False
-
-        if bed_temp is None or bed_humid is None:
-            print("[WARN] Bedroom DHT22 đọc lỗi tạm thời, giữ nguyên nhiệt độ/độ ẩm trước đó.")
-        else:
-            state["bed_temp"] = round(float(bed_temp), 1)
-            state["bed_humid"] = round(float(bed_humid), 1)
-
-        state["bed_light"] = round(float(bed_light), 1)
-        state["bed_motion"] = bool(data.get("motion", False))
-        state["bed_fan"] = bool(data.get("fan", False))
-        state["bed_led"] = bool(data.get("led", False))
-        state["bed_alarm_level"] = int(data.get("alarm_level", 0))
-
-        _update_presence()
-
-        print(f"[{ts}] BEDROOM | "
-              f"Nhiệt độ: {state['bed_temp']}°C  "
-              f"Độ ẩm: {state['bed_humid']}%  "
-              f"Ánh sáng: {state['bed_light']} lux  "
-              f"PIR: {'Có' if state['bed_motion'] else 'Không'}")
-
-        safe_append_log({"ts": ts, "node": "bedroom", **{
-            "temp": state["bed_temp"],
-            "humid": state["bed_humid"],
-            "light": state["bed_light"],
-            "motion": state["bed_motion"],
-        }})
-        evaluate_fire_gas_context()
-        return True
-
-    return False
+    print(f"[{ts}] [DOOR] {'Cửa đang mở.' if is_open else 'Cửa đã đóng.'}")
+    _emit_door_status()
 
 
-def cleanup():
-    global ser, _log_fh
-    try:
-        _clear_fire_gas_alarm()
-    except Exception:
-        pass
-    if ser is not None and ser.is_open:
+def _on_door_state_change(channel):
+    is_open = GPIO.input(REED_PIN) == GPIO.HIGH   # HIGH = mạch hở = cửa đang mở
+    _apply_door_state(is_open)
+
+
+# ==========================================
+# PIR - PHÁT HIỆN CHUYỂN ĐỘNG
+# ==========================================
+# Tầng 1: lọc GPIO (WARMUP -> WAIT_LOW -> READY), giống updatePirFilter() bên bedroom.
+class _PirFilter:
+    WARMUP, WAIT_LOW, READY = "WARMUP", "WAIT_LOW", "READY"
+
+    def __init__(self, now):
+        self.phase = self.WARMUP
+        self.boot = now
+        self.raw = -1                 # chưa lấy mẫu
+        self.filtered = False
+        self.stable_since = now
+        self.last_sample = now
+
+    def update(self, now, raw):
+        gap = now - self.last_sample
+        self.last_sample = now
+        changed = raw != self.raw
+        self.raw = raw
+        if changed and PIR_DEBUG_RAW:
+            print(f"[PIR] RAW={raw}")
+
+        # Thread bị trễ (GIL, đọc DHT...) thì xác nhận lại từ mẫu mới.
+        if changed or gap > 3 * PIR_SAMPLE_SEC:
+            self.stable_since = now
+
+        if self.phase == self.WARMUP:
+            if now - self.boot < PIR_WARMUP_SEC:
+                return
+            self.phase = self.WAIT_LOW
+            self.stable_since = now
+            print(f"[PIR] WAIT_LOW ({PIR_STARTUP_LOW_SEC:.0f} s)")
+
+        if self.phase == self.WAIT_LOW:
+            if raw == GPIO.LOW and now - self.stable_since >= PIR_STARTUP_LOW_SEC:
+                self.phase = self.READY
+                print("[PIR] READY")
+            return
+
+        high = raw == GPIO.HIGH
+        if high != self.filtered:
+            self.filtered = high
+            print(f"[PIR] FLT={1 if high else 0}")
+
+
+# Tầng 2: xác nhận có người, giống updateRoomPresence() bên bedroom.
+#   EMPTY --cạnh lên--> WAIT_SECOND --cạnh lên sau 2-5 s--> OCCUPIED
+#   WAIT_SECOND --quá 5 s--> EMPTY ;  OCCUPIED --FLT=0 liên tục 5 s--> EMPTY
+class _RoomPresence:
+    EMPTY, WAIT_SECOND, OCCUPIED = "EMPTY", "WAIT_SECOND", "OCCUPIED"
+
+    def __init__(self):
+        self.status = self.EMPTY
+        self.first_pulse = 0.0
+        self.prev_motion = False
+        self.last_edge = 0.0
+
+    def update(self, motion, now):
+        since_edge = now - self.last_edge
+
+        # Xét hết hạn trước khi xử lý cạnh mới.
+        if self.status == self.WAIT_SECOND and now - self.first_pulse > ENTRY_WINDOW_SEC:
+            self.status = self.EMPTY
+            print("[ROOM] EMPTY (entry window expired)")
+        elif (self.status == self.OCCUPIED and not self.prev_motion
+              and since_edge >= PRESENCE_HOLD_SEC):
+            self.status = self.EMPTY
+            print(f"[ROOM] EMPTY (FLT=0 for {since_edge:.1f} s)")
+
+        if motion != self.prev_motion:
+            self.prev_motion = motion
+            self.last_edge = now
+            state["last_motion_ts"] = time.time()   # dùng cho bộ đếm thả ghi đè nút
+            if motion and self.status == self.EMPTY:
+                self.first_pulse = now
+                self.status = self.WAIT_SECOND
+                print("[ROOM] WAIT_SECOND")
+            elif (motion and self.status == self.WAIT_SECOND
+                  and now - self.first_pulse >= ENTRY_MIN_INTERVAL_SEC):
+                self.status = self.OCCUPIED
+                print("[ROOM] OCCUPIED")
+            elif motion and self.status == self.OCCUPIED:
+                print(f"[ROOM] LOW_GAP={since_edge:.1f} s")
+
+        return self.status == self.OCCUPIED
+
+
+_pir = None                          # _PirFilter (để in log)
+_presence = False                    # kết quả tầng 2, vòng chính đọc
+_presence_event = threading.Event()  # báo vòng chính khi _presence đổi -> phản ứng ngay
+_pir_thread = None
+
+
+def _pir_loop():
+    global _pir, _presence
+    now = time.monotonic()
+    _pir = _PirFilter(now)
+    room = _RoomPresence()
+    print(f"[PIR] WARMUP {PIR_WARMUP_SEC:.0f} s")
+    while not _stop_flag:
+        now = time.monotonic()
+        _pir.update(now, GPIO.input(PIR_PIN))
+        occupied = room.update(_pir.filtered, now)
+        if occupied != _presence:
+            _presence = occupied
+            _presence_event.set()
+        time.sleep(PIR_SAMPLE_SEC)
+
+
+def _is_occupied() -> bool:
+    """Giữ tên cũ: trả về trạng thái có người đã xác nhận."""
+    return _presence
+
+
+def _emit_door_status():
+    _emit_event("door_status", {
+        "locked": state["door_locked"],
+        "open": state["door_open"],
+        "ts": datetime.now().isoformat(),
+    })
+
+
+def _emit_alarm(alarm_type: str):
+    _emit_event("alarm", {
+        "type": alarm_type,
+        "ts": datetime.now().isoformat(),
+    })
+
+
+def set_yolo_people_count(count: int):
+    """Cho tiến trình YOLO cập nhật số người thấy được trong phòng khách."""
+    state["yolo_people_count"] = max(0, int(count))
+    state["last_yolo_ts"] = time.time()
+
+
+def trigger_fire_gas_alarm(level: str, context: str, details: dict | None = None):
+    global _pre_alarm_snapshot, _last_alarm_key 
+    if not state["fire_gas_alarm"]:
+        _pre_alarm_snapshot = {
+            "app_manual": dict(_app_manual),
+            "btn_override": dict(_btn_override),
+            "fan": state["fan"],
+            "fan_level": state["fan_level"],
+            "led": state["led"],
+        }
+    
+    state["fire_gas_alarm"] = True
+    state["fire_gas_level"] = level
+
+    _btn_override["led"] = False     # báo cháy/gas: bỏ ghi đè của nút
+    _btn_override["fan"] = False
+
+    fan_on(3)                        # báo cháy/gas: quạt mức cao nhất
+    led_on()
+    if level in ("MAX", "RED"):
+        GPIO.output(BUZZER_PIN, GPIO.HIGH)
+
+    payload = {
+        "type": "fire_gas",
+        "level": level,
+        "context": context,
+        "details": details or {},
+        "ts": datetime.now().isoformat(),
+    }
+    _emit_event("alarm", payload)
+    _emit_event("fire_gas", payload)
+
+
+def clear_fire_gas_alarm():
+    global _pre_alarm_snapshot, _btn_override, _force_eval, _last_alarm_key, _last_btn_ts
+    snap = _pre_alarm_snapshot
+    _pre_alarm_snapshot = None
+    _last_alarm_key = None
+    
+    state["fire_gas_alarm"] = False
+    state["fire_gas_level"] = "CLEAR"
+    # Luôn tắt còi (lúc cháy cửa thoát hiểm được mở nên không phụ thuộc trạng thái cửa)
+    GPIO.output(BUZZER_PIN, GPIO.LOW)
+    # Giống ALARM_OFF bên C: xoá manual + override, tắt quạt/đèn
+    
+    if snap is None:
+        set_auto("alarm_clear")
+    else:
+        _app_manual.update(snap["app_manual"])
+        _btn_override["fan"] = snap["btn_override"]["fan"]
+        _btn_override["led"] = snap["btn_override"]["led"]
+
+        # Thiết bị đang MANUAL: trả về đúng trạng thái (và mức quạt) trước khi báo cháy
+        if get_mode("fan") == "MANUAL":
+            fan_set_level(snap["fan_level"] if snap["fan"] else 0)
+        if get_mode("led") == "MANUAL":
+            (led_on if snap["led"] else led_off)()
+                    
+        if any(_btn_override.values()):
+            _last_btn_ts = time.time()  # reset thời gian ghi đè nút để tránh tự thả quá sớm
+        _force_eval = True  # đánh giá auto ngay
+        print("[LIVING ROOM] Hết báo cháy/gas: khôi phục trạng thái trước đó.")
+        
+    _emit_event("fire_gas", {
+        "type": "fire_gas",
+        "level": "CLEAR",
+        "ts": datetime.now().isoformat(),
+    })
+
+
+# ==========================================
+# NÚT NHẤN: nhấn ngắn = bật/tắt (manual), giữ 2 s = về tự động
+# Đèn trên CẢ 2 nút sáng khi đèn chiếu sáng TẮT
+# ==========================================
+class _Button:
+    def __init__(self, pin):
+        self.pin = pin
+        self.stable = False          # True = đang nhấn
+        self.last_reading = False
+        self.last_change = 0.0
+        self.press_start = 0.0
+        self.long_fired = False
+
+    def read(self, now):
+        """Trả về 'short', 'long' hoặc None."""
+        reading = GPIO.input(self.pin) == GPIO.LOW
+        if reading != self.last_reading:
+            self.last_reading = reading
+            self.last_change = now
+        if now - self.last_change > BTN_DEBOUNCE_SEC and reading != self.stable:
+            self.stable = reading
+            if self.stable:
+                self.press_start = now
+                self.long_fired = False
+            elif not self.long_fired:
+                return "short"
+        if self.stable and not self.long_fired and now - self.press_start >= BTN_LONG_PRESS_SEC:
+            self.long_fired = True
+            return "long"
+        return None
+
+
+def _update_button_lamps():
+    lamp = GPIO.LOW if state["led"] else GPIO.HIGH
+    GPIO.output(BTN_LED_SIG1, lamp)
+    GPIO.output(BTN_FAN_SIG1, lamp)
+
+# Hàm nhấp nháy đèn nút khi chuyển sang chế độ AUTO mỗi nút điều khiển đèn
+def _blink_button_lamps_led():
+    for _ in range(3):
+        GPIO.output(BTN_LED_SIG1, GPIO.HIGH)
+        time.sleep(0.1)
+        GPIO.output(BTN_LED_SIG1, GPIO.LOW)
+        time.sleep(0.1)
+    _update_button_lamps()
+    
+# Hàm nhấp nháy đèn nút khi chuyển sang chế độ AUTO mỗi nút điều khiển quạt
+def _blink_button_lamps_fan():
+    for _ in range(3):
+        GPIO.output(BTN_FAN_SIG1, GPIO.HIGH)
+        time.sleep(0.1)
+        GPIO.output(BTN_FAN_SIG1, GPIO.LOW)
+        time.sleep(0.1)
+    _update_button_lamps()
+
+def _button_loop():
+    global _last_btn_ts, _force_eval
+    buttons = {"led": _Button(BTN_LED_SIG2), "fan": _Button(BTN_FAN_SIG2)}
+    on_fn = {"led": led_on, "fan": lambda: fan_set_level(_last_fan_level)}
+    off_fn = {"led": led_off, "fan": fan_off}
+
+    while not _stop_flag:
+        now = time.time()
+
+        for dev, btn in buttons.items():
+            ev = btn.read(now)
+            if ev is None:
+                continue
+
+            # An toàn: đang báo cháy/gas thì bỏ qua nút
+            if state["fire_gas_alarm"]:
+                print(f"[BTN] Đang báo cháy/gas, bỏ qua nút {dev}.")
+                continue
+
+            if ev == "short":
+                new_on = not state[dev]
+                (on_fn if new_on else off_fn)[dev]()
+                _btn_override[dev] = True
+                _last_btn_ts = now
+                print(f"[BTN] {dev} -> {'ON' if new_on else 'OFF'} (MANUAL)")
+                ev_payload = {"device": dev, "on": new_on}
+                if dev == "fan":
+                    ev_payload["level"] = state["fan_level"]
+                _emit_event("device_state", ev_payload)  # đồng bộ app
+            else:  # long
+                _btn_override[dev] = False
+                _app_manual[dev] = False    # giữ nút 2 s = thiết bị NÀY về AUTO (kể cả manual từ app)
+                _force_eval = True          # đánh giá auto ngay
+                print(f"[BTN] {dev} -> AUTO")
+                if dev == "led":
+                    _blink_button_lamps_led()
+                else:
+                    _blink_button_lamps_fan()
+
+        # Tự thả ghi đè nút khi không còn chuyển động đủ lâu (giữ nguyên manual đặt từ app)
+        if (BTN_OVERRIDE_RELEASE_SEC > 0 and any(_btn_override.values()) and not _presence
+                and now - max(state["last_motion_ts"], _last_btn_ts) >= BTN_OVERRIDE_RELEASE_SEC):
+            print("[BTN] Không có người lâu: nút trả về AUTO")
+            _btn_override["led"] = _btn_override["fan"] = False
+
+        _update_button_lamps()
+        time.sleep(0.02)
+
+
+# ==========================================
+# ĐỌC CẢM BIẾN ÁNH SÁNG (BH1750)
+# ==========================================
+def _read_lux():
+    global _last_lux_warn_ts
+    if i2c_bus is None:
+        return None
+
+    for attempt in range(3):
         try:
-            ser.close()
-            print("[INFO] Đã đóng cổng serial.")
-        except Exception:
-            pass
-    if _log_fh is not None:
-        try:
-            _log_fh.flush()
-            os.fsync(_log_fh.fileno())
-            _log_fh.close()
-            print("[INFO] Đã đóng file log an toàn.")
-        except Exception:
-            pass
+            data = i2c_bus.read_i2c_block_data(BH1750_ADDR, 0x10, 2)
+            lux = (data[0] << 8 | data[1]) / 1.2
+            return round(lux, 1)
+        except OSError as e:
+            if getattr(e, "errno", None) == 11 and attempt < 2:
+                time.sleep(0.05)
+                continue
+            now = time.time()
+            if now - _last_lux_warn_ts >= 30:
+                _last_lux_warn_ts = now
+                print(f"[WARN] Đọc BH1750 lỗi: {e}")
+            return None
+        except Exception as e:
+            now = time.time()
+            if now - _last_lux_warn_ts >= 30:
+                _last_lux_warn_ts = now
+                print(f"[WARN] Đọc BH1750 lỗi: {e}")
+            return None
+
+
+# ==========================================
+# ĐỌC NHIỆT ĐỘ / ĐỘ ẨM (DHT22)
+# ==========================================
+def _read_dht():
     try:
-        living_room.stop()
-        print("[INFO] Đã dọn dẹp phòng khách (GPIO, MQTT).")
+        t, h = _dht.temperature, _dht.humidity
+        if t is None or h is None:
+            return None, None
+        return round(t, 1), round(h, 1)
+    except RuntimeError:
+        return None, None
+    except Exception as e:          # lỗi khác: không để sập thread
+        print(f"[WARN] DHT lỗi: {e}")
+        return None, None
+
+# ==========================================
+# VÒNG LẶP CHÍNH CỦA PHÒNG KHÁCH
+# ==========================================
+def run():
+    """Gọi hàm này trong 1 thread riêng từ gateway.py."""
+    global _btn_thread, _pir_thread, _force_eval
+
+    setup_gpio()
+    _apply_door_state(GPIO.input(REED_PIN) == GPIO.HIGH)
+    lock_door()
+
+    _btn_thread = threading.Thread(target=_button_loop, daemon=True)
+    _btn_thread.start()
+    _pir_thread = threading.Thread(target=_pir_loop, daemon=True)
+    _pir_thread.start()
+
+    print("[LIVING ROOM] Sẵn sàng.")
+    last_sensor_read = float("-inf")
+    last_lux_read = float("-inf")
+    last_presence = False
+    last_lux_ok = False      # lần đọc BH1750 gần nhất có thành công không
+    bright_samples = 0       # số mẫu lux >= LUX_OFF_THRESHOLD liên tiếp (tối đa BRIGHT_SAMPLES_TO_TURN_OFF)
+    temp_hot = False         # trạng thái nóng có trễ 28/26 °C
+
+    while not _stop_flag:
+        # Ngủ tối đa 50 ms, nhưng thức ngay khi tầng PIR báo presence đổi.
+        _presence_event.wait(0.05)
+        _presence_event.clear()
+
+        now = time.monotonic()
+        _apply_door_state(GPIO.input(REED_PIN) == GPIO.HIGH)   # poll dự phòng
+
+        # 1. Hiện diện đã xác nhận (tầng 1 + 2 chạy trong _pir_loop)
+        presence = _presence
+        presence_changed = presence != last_presence
+        last_presence = presence
+        state["motion"] = presence
+
+        force = _force_eval
+        if force:
+            _force_eval = False
+        sensor_due = now - last_sensor_read >= SENSOR_INTERVAL_SEC
+        lux_due = now - last_lux_read >= LUX_SAMPLE_SEC
+        if not (sensor_due or lux_due or presence_changed or force):
+            continue
+
+        # 2. DHT mỗi 2 s, BH1750 mỗi 300 ms
+        if sensor_due:
+            last_sensor_read = now
+            temp, humid = _read_dht()
+            if temp is not None:
+                state["temp"], state["humid"] = temp, humid
+                if temp >= FAN_TEMP_ON_C:
+                    temp_hot = True
+                elif temp <= FAN_TEMP_OFF_C:
+                    temp_hot = False
+
+        if lux_due:
+            last_lux_read = now
+            lux = _read_lux()
+            last_lux_ok = lux is not None
+            if last_lux_ok:
+                state["lux"] = lux
+            if last_lux_ok and lux >= LUX_OFF_THRESHOLD:
+                bright_samples = min(bright_samples + 1, BRIGHT_SAMPLES_TO_TURN_OFF)
+            else:
+                bright_samples = 0
+
+        # 3. Điều khiển (nhường manual app, nút nhấn và báo cháy/gas)
+        led_before, fan_before = state["led"], state["fan"]
+        if not state["fire_gas_alarm"]:
+            # Quạt: có người + nóng -> bật; còn lại -> tắt. Xét mỗi 2 s hoặc ngay khi presence đổi.
+            if (get_mode("fan") == "AUTO"
+                    and (sensor_due or presence_changed or force)):
+                if presence and temp_hot:
+                    fan_on(FAN_AUTO_LEVEL)
+                elif state["fan"]:
+                    fan_off()
+
+            # Đèn: bật khi có người + < 50 lux; tắt khi hết người hoặc sáng >= 100 lux 2 mẫu liền.
+            if get_mode("led") == "AUTO":
+                if state["led"] and (not presence
+                                     or bright_samples >= BRIGHT_SAMPLES_TO_TURN_OFF):
+                    led_off()
+                elif (presence and not state["led"] and last_lux_ok
+                      and state["lux"] < LUX_ON_THRESHOLD):
+                    led_on()
+
+        # 4. Log + gửi gateway: định kỳ 2 s, hoặc ngay khi có thay đổi
+        if not (sensor_due or presence_changed or force
+                or led_before != state["led"] or fan_before != state["fan"]):
+            continue
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        pir_phase = _pir.phase if _pir else "-"
+        pir_raw = _pir.raw if _pir else -1
+        pir_flt = int(_pir.filtered) if _pir else 0
+        print(f"[{ts}] LIVING ROOM | "
+              f"Nhiệt độ: {state['temp']}°C  Độ ẩm: {state['humid']}%  "
+              f"Ánh sáng: {state['lux']} lux  "
+              f"Người: {'Có' if presence else 'Không'}  "
+              f"Quạt: {'ON' if state['fan'] else 'OFF'}  "
+              f"Đèn: {'ON' if state['led'] else 'OFF'}  "
+              f"Cửa: {'Mở' if state['door_open'] else 'Đóng'}/"
+              f"{'Khoá' if state['door_locked'] else 'Chưa khoá'}  "
+              f"PIR={pir_phase} RAW={pir_raw} FLT={pir_flt} HOT={int(temp_hot)} "
+              f"bright={bright_samples}/{BRIGHT_SAMPLES_TO_TURN_OFF} "
+              f"mode=led:{get_mode('led')}/fan:{get_mode('fan')} lv={state['fan_level']}"
+              )
+        _emit_event("sensor_reading", {
+            "ts": ts,
+            "node": "living_room",
+            "temp": state["temp"],
+            "humid": state["humid"],
+            "lux": state["lux"],
+            "motion": presence,
+            "fan": state["fan"],
+            "fan_level": state["fan_level"],
+            "led": state["led"],
+            "door_open": state["door_open"],
+            "door_locked": state["door_locked"],
+        })
+
+
+def stop():
+    global _stop_flag
+    _stop_flag = True
+    _presence_event.set()   # đánh thức vòng chính để thoát nhanh
+    if _btn_thread is not None:
+        _btn_thread.join(timeout=1)
+    if _pir_thread is not None:
+        _pir_thread.join(timeout=1)
+    try:
+        fan_off()
+        led_off()
+        GPIO.output(BUZZER_PIN, GPIO.LOW)
+        GPIO.output(BTN_LED_SIG1, GPIO.LOW)
+        GPIO.output(BTN_FAN_SIG1, GPIO.LOW)
+        _servo_pwm.stop()
+        _fan_pwm.stop()
+        GPIO.output(FAN_INA_PIN, GPIO.LOW)
+        # KHÔNG trả INA về input: GPIO.cleanup() mặc định đưa mọi chân về input,
+        # INA bỏ trống bị điện trở kéo lên của module -> quạt tự quay khi gateway dừng/khởi động lại.
+        GPIO.cleanup([p for p in (PIR_PIN, REED_PIN, BUZZER_PIN, LED_PIN, SERVO_PIN,
+                                  BTN_LED_SIG2, BTN_FAN_SIG2, BTN_LED_SIG1, BTN_FAN_SIG1)])
     except Exception:
         pass
-    try:
-        fb.stop()       # đánh dấu gateway offline và xả hàng đợi ghi Firestore
-    except Exception:
-        pass
-    cleanup_mqtt()
 
 
-def handle_signal(signum, frame):
-    global _shutdown
-    if _shutdown:
-        return
-    _shutdown = True
-    print(f"\n[INFO] Nhận tín hiệu dừng ({signum}), đang dọn dẹp...")
-    cleanup()
-    sys.exit(0)
-
-
-def main():
-    global _living_room_thread
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    living_room.set_event_callback(_on_living_room_event)
-    setup_mqtt()
-    fb.start()   # lỗi (thiếu thư viện / khoá / mạng) chỉ cảnh báo, gateway vẫn chạy
-
-    _living_room_thread = threading.Thread(target=living_room.run, daemon=True)
-    _living_room_thread.start()
-
-    # Bridge có thể chưa cắm: thử mở 1 lần. Lỗi thì gateway VẪN CHẠY (phòng khách, MQTT, app)
-    # và cứ BRIDGE_RETRY_SEC giây tự thử lại, nên cắm bridge vào sau cũng được.
-    print(f"Đang kết nối bridge {PORT} @ {BAUD_RATE} baud ...")
-    if not _open_serial():
-        print("[INFO] Gateway vẫn chạy không có bridge, sẽ tự thử lại mỗi "
-              f"{BRIDGE_RETRY_SEC:.0f} giây.")
-    last_bridge_try = time.time()
-    print("Gateway sẵn sàng.\n")
-
-    last_house_print = 0.0
-    last_context_eval = 0.0
-    last_app_publish = 0.0
-    last_fb_state = 0.0
-
+# ==========================================
+# TEST SERVO ĐỘC LẬP:  python3 living_room.py
+# ==========================================
+if __name__ == "__main__":
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(SERVO_PIN, GPIO.OUT)
+    _servo_pwm = GPIO.PWM(SERVO_PIN, SERVO_FREQ)
+    _servo_pwm.start(0)
     try:
         while True:
-            now = time.time()
-
-            # ---- Bridge: đọc dữ liệu, hoặc tự thử kết nối lại nếu chưa có / bị rút ----
-            port = ser
-            if port is None or not port.is_open:
-                if now - last_bridge_try >= BRIDGE_RETRY_SEC:
-                    last_bridge_try = now
-                    _open_serial()
-            else:
-                raw = None
-                try:
-                    if port.in_waiting:
-                        raw = port.readline().decode("utf-8", errors="replace")
-                except (serial.SerialException, OSError) as e:
-                    _handle_bridge_lost(e)
-                if raw:
-                    parse_data(raw)
-
-            now = time.time()   # _open_serial() có thể mất ~2 s
-            if now - last_context_eval >= 1.0:
-                last_context_eval = now
-                evaluate_fire_gas_context()
-
-            if now - last_app_publish >= APP_PUBLISH_INTERVAL_SEC:
-                last_app_publish = now
-                publish_sensors_to_app()
-
-            if now - last_fb_state >= FIREBASE_STATE_INTERVAL_SEC:
-                last_fb_state = now
-                fb.publish_state(_firebase_state_snapshot())
-
-            if now - last_house_print >= 5.0:
-                last_house_print = now
-                lr = living_room.state
-                ts = datetime.now().strftime("%H:%M:%S")
-                bridge_txt = "OK" if _bridge_online else "MẤT"
-                print(f"[{ts}] =========== TOÀN NHÀ =========| "
-                      f"Bridge: {bridge_txt}  "
-                      f"Kitchen: {state['kit_temp']}°C/{state['kit_humid']}%/"
-                      f"gas={state['kit_gas_raw']}  "
-                      f"Ngưỡng: {state.get('kit_gas_threshold')}  "
-                      f"Bedroom: {state['bed_temp']}°C/{state['bed_humid']}%  "
-                      f"Living room: {lr['temp']}°C/{lr['humid']}%  "
-                      f"Người: {'Có' if _update_presence() else 'Không'}  "
-                      f"Cửa: {'Mở' if lr['door_open'] else 'Đóng'} / "
-                      f"Khoá: {'Có' if lr['door_locked'] else 'Không'}  "
-                      f"Gas/Fire: {state['fire_gas_context']}/{state['fire_gas_level']}\n")
-
-            time.sleep(0.05)
-
+            for a in (SERVO_LOCK_ANGLE, SERVO_UNLOCK_ANGLE):
+                print(f"Quay tới {a}°")
+                _set_servo_angle(a)
+                time.sleep(1.5)
     except KeyboardInterrupt:
-        print("\n[INFO] Đã dừng (Ctrl+C).")
+        pass
     finally:
-        cleanup()
-
-
-if __name__ == "__main__":
-    main()
+        _servo_pwm.stop()
+        GPIO.cleanup()
+        
