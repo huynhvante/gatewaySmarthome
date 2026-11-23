@@ -298,6 +298,7 @@ def publish_sensors_to_app():
     _pub_sensor("living_room", "dht", "temperature", lr.get("temp"))
     _pub_sensor("living_room", "dht", "humidity", lr.get("humid"))
     _pub_sensor("living_room", "reed", "open", lr.get("door_open"))
+    _pub_sensor("living_room", "light_sensor", "lux", lr.get("lux"))
 
     # Bếp/phòng ngủ lấy qua bridge: mất bridge thì KHÔNG publish giá trị cũ như thể còn mới
     if not _bridge_online:
@@ -403,17 +404,14 @@ def _parse_fan_level(raw_value: str):
 
 
 # Mức quạt bếp/phòng ngủ: smarthome/<kitchen|bedroom>/fan_level/set, payload 0..3.
-# Gửi FAN_ON/FAN_OFF TRƯỚC rồi FAN_LEVEL=n: firmware cũ (chưa có PWM theo mức) vẫn bật/tắt được,
-# firmware mới nhận FAN_LEVEL sau cùng nên chạy đúng mức. Quạt chuyển MANUAL.
+# Bridge dịch FAN_LEVEL=n sang FAN_n cho hai node PWM. Gửi một lệnh cho mỗi lần chọn mức.
 def _handle_node_fan_level_command(room: str, raw_value: str):
     level = _parse_fan_level(raw_value)
     if level is None:
         msg = f"Mức quạt không hợp lệ: '{raw_value}' (cần 0..3)."
         _notify_gateway_error(msg)
         return False, msg
-    ok = (send_command(room, "FAN_ON" if level > 0 else "FAN_OFF", force=True)
-          and send_command(room, f"FAN_LEVEL={level}", force=True))
-    if not ok:
+    if not send_command(room, f"FAN_LEVEL={level}", force=True):
         msg = f"Không gửi được mức quạt {room} = {level}: bridge chưa kết nối."
         _notify_gateway_error(msg)
         return False, msg
@@ -579,6 +577,7 @@ def _firebase_state_snapshot() -> dict:
         "living_room": {
             "temp": lr.get("temp"),
             "humid": lr.get("humid"),
+            "lux": lr.get("lux"),
             "motion": lr.get("motion"),
             "fan": lr.get("fan"),
             "fan_level": lr.get("fan_level"),
@@ -1114,6 +1113,10 @@ def _read_node_modes(data: dict, prefix: str):
         v = data.get(f"{dev}_mode")
         if isinstance(v, str) and v.strip().upper() in ("AUTO", "MANUAL"):
             state[f"{prefix}_{dev}_mode"] = v.strip().upper()
+
+    button = data.get("fan_button")
+    if prefix == "bed" and type(button) is int and button in (1, 2, 3, 255):
+        _publish_raw(f"{ROOT_TOPIC}/bedroom/fan_button/event", button, qos=1, retain=False)
 
 
 def parse_data(line: str) -> bool:
