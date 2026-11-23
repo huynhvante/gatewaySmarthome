@@ -35,7 +35,6 @@ MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 MQTT_CLIENT_ID = "raspi-home-gateway"
 
 # --- Firebase (Firestore) ---
-# File khoá đọc từ biến môi trường FIREBASE_KEY_PATH (mặc định: serviceAccountKey.json cạnh gateway.py)
 FIREBASE_GATEWAY_ID = MQTT_CLIENT_ID
 FIREBASE_STATE_INTERVAL_SEC = 15.0      # chu kỳ ghi state/<gateway_id>
 FIREBASE_FCM_TOPIC = None               # đặt "alerts" nếu app Android đã subscribe topic FCM
