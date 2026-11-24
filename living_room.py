@@ -28,6 +28,9 @@ FAN_SPEED    = 80
 # Mức 3 = 80% đúng bằng tốc độ cũ; chế độ AUTO luôn chạy mức FAN_AUTO_LEVEL.
 FAN_LEVEL_DUTY = (0, 50, 65, 80)
 FAN_AUTO_LEVEL = 3
+# Nút quạt xanh (giống bedroom): nhấn 1/2/3 lần liên tiếp = mức 1/2/3; nhả tay quá FAN_TAP_GAP_SEC thì chốt.
+# Đang chạy tay mà nhấn 1 lần = tắt. Nhấn > 3 lần = bỏ qua. Giữ 2 s = về AUTO.
+FAN_TAP_GAP_SEC = 0.5
 
 LED_PIN      = 22   # GPIO22 (chân vật lý 15)
 DHT_PIN      = board.D4           # truyền thẳng vào adafruit_dht.DHT11 chân GPIO4 (chân vật lý 7)
@@ -736,10 +739,10 @@ def _blink_button_lamps_fan():
     _update_button_lamps()
 
 def _button_loop():
-    global _last_btn_ts, _force_eval
+    global _last_btn_ts, _force_eval, _last_fan_level
     buttons = {"led": _Button(BTN_LED_SIG2), "fan": _Button(BTN_FAN_SIG2)}
-    on_fn = {"led": led_on, "fan": lambda: fan_set_level(_last_fan_level)}
-    off_fn = {"led": led_off, "fan": fan_off}
+    fan_taps = 0              # số lần nhấn ngắn nút xanh trong chuỗi hiện tại
+    last_fan_release = 0.0
 
     while not _stop_flag:
         now = time.time()
@@ -751,19 +754,22 @@ def _button_loop():
 
             # An toàn: đang báo cháy/gas thì bỏ qua nút
             if state["fire_gas_alarm"]:
+                if dev == "fan":
+                    fan_taps = 0
                 print(f"[BTN] Đang báo cháy/gas, bỏ qua nút {dev}.")
                 continue
 
-            if ev == "short":
-                new_on = not state[dev]
-                (on_fn if new_on else off_fn)[dev]()
-                _btn_override[dev] = True
+            if ev == "short" and dev == "led":
+                new_on = not state["led"]
+                led_on() if new_on else led_off()
+                _btn_override["led"] = True
                 _last_btn_ts = now
-                print(f"[BTN] {dev} -> {'ON' if new_on else 'OFF'} (MANUAL)")
-                ev_payload = {"device": dev, "on": new_on}
-                if dev == "fan":
-                    ev_payload["level"] = state["fan_level"]
-                _emit_event("device_state", ev_payload)  # đồng bộ app
+                print(f"[BTN] led -> {'ON' if new_on else 'OFF'} (MANUAL)")
+                _emit_event("device_state", {"device": "led", "on": new_on})  # đồng bộ app
+            elif ev == "short":
+                # Nút xanh: chỉ đếm, chốt mức sau khi nhả tay FAN_TAP_GAP_SEC (giống bedroom)
+                fan_taps = min(fan_taps + 1, 5)
+                last_fan_release = now
             else:  # long
                 _btn_override[dev] = False
                 _app_manual[dev] = False    # giữ nút 2 s = thiết bị NÀY về AUTO (kể cả manual từ app)
@@ -771,8 +777,36 @@ def _button_loop():
                 print(f"[BTN] {dev} -> AUTO")
                 if dev == "led":
                     _blink_button_lamps_led()
+                    _emit_event("device_state", {"device": "led", "on": state["led"]})
                 else:
+                    fan_taps = 0            # giữ nút huỷ chuỗi nhấn đang đếm
                     _blink_button_lamps_fan()
+                    _emit_event("device_state", {"device": "fan", "on": state["fan"],
+                                                 "level": state["fan_level"]})
+                    _emit_event("fan_button", {"value": 255})   # 255 = giữ nút về AUTO (giống bedroom)
+
+        # Chốt chuỗi nhấn nút xanh: đã nhả hẳn và quá FAN_TAP_GAP_SEC không nhấn thêm
+        fan_btn = buttons["fan"]
+        if (fan_taps and not fan_btn.stable and not fan_btn.last_reading
+                and now - last_fan_release >= FAN_TAP_GAP_SEC):
+            taps, fan_taps = fan_taps, 0
+            if state["fire_gas_alarm"]:
+                pass
+            elif taps <= 3:
+                fan_manual = _btn_override["fan"] or _app_manual["fan"]
+                turn_off = taps == 1 and fan_manual and state["fan_level"] > 0
+                level = 0 if turn_off else taps
+                if level > 0:
+                    _last_fan_level = level     # app bật lại (ON) sẽ dùng mức này
+                fan_set_level(level)
+                _btn_override["fan"] = True
+                _last_btn_ts = now
+                print(f"[BTN] fan -> mức {state['fan_level']} ({taps} lần nhấn, MANUAL)")
+                _emit_event("device_state", {"device": "fan", "on": state["fan"],
+                                             "level": state["fan_level"]})   # đồng bộ app
+                _emit_event("fan_button", {"value": taps})                  # 1/2/3 = số lần nhấn
+            else:
+                print(f"[BTN] fan: {taps} lần nhấn, bỏ qua")
 
         # Tự thả ghi đè nút khi không còn chuyển động đủ lâu (giữ nguyên manual đặt từ app)
         if (BTN_OVERRIDE_RELEASE_SEC > 0 and any(_btn_override.values()) and not _presence

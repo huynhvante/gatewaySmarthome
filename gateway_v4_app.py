@@ -667,6 +667,12 @@ def _on_living_room_event(event_type: str, payload: dict):
             mode = living_room.get_mode(dev)
             _device_states[("living_room", f"{dev}_mode")] = mode
             _publish_device_state("living_room", f"{dev}_mode", mode)
+    elif event_type == "fan_button":
+        # Nút quạt phòng khách, giống bedroom: 1/2/3 = số lần nhấn, 255 = giữ về AUTO.
+        # QoS 1, không retain để app mở lại không nhận nhầm lần nhấn cũ.
+        value = payload.get("value")
+        if value in (1, 2, 3, 255):
+            _publish_raw(f"{ROOT_TOPIC}/living_room/fan_button/event", value, qos=1, retain=False)
 
 
 def _on_mqtt_connect(client, userdata, flags, rc, properties=None):
