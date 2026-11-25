@@ -16,7 +16,7 @@ PIR_PIN      = 27 # GPIO27 (chân vật lý 13)
 REED_PIN     = 17 # GPIO17 (chân vật lý 11)
 
 SERVO_PIN    = 18      # SG90 - dây tín hiệu vào GPIO18 (chân vật lý 12)
-BUZZER_PIN   = 25    # GPIO25 (chân vật lý 22) - active HIGH
+# Phòng khách KHÔNG có còi: báo động gas/cháy kêu bằng còi ở bếp và phòng ngủ (node ESP32).
 
 FAN_INA_PIN  = 23   # GPIO23 (chân vật lý 16)
 FAN_INB_PIN  = 19   # GPIO19 (chân vật lý 35) - PWM PHẦN CỨNG PWM0_CHAN3 của chip RP1 (trước đây GPIO24 chân 18)
@@ -207,7 +207,6 @@ def setup_gpio():
 
     GPIO.setup(PIR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)   # giống INPUT_PULLDOWN bên ESP
     GPIO.setup(REED_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # đóng cửa = mạch kín = LOW
-    GPIO.setup(BUZZER_PIN, GPIO.OUT, initial=GPIO.LOW)
     GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
 
     GPIO.setup(FAN_INA_PIN, GPIO.OUT, initial=GPIO.LOW)
@@ -377,7 +376,7 @@ def set_mode(device: str, mode: str, source: str = "app"):
 
 
 def set_auto(source: str = "app"):
-    """Tương đương lệnh AUTO / ALARM_OFF bên C: đưa CẢ đèn và quạt về AUTO, tắt còi/đèn/quạt.
+    """Tương đương lệnh AUTO / ALARM_OFF bên C: đưa CẢ đèn và quạt về AUTO, tắt đèn/quạt.
     Đang báo cháy/gas thì không tắt thiết bị (giữ điểm an toàn riêng của Python)."""
     global _force_eval
     _app_manual["led"] = _app_manual["fan"] = False
@@ -385,7 +384,6 @@ def set_auto(source: str = "app"):
     _btn_override["fan"] = False
     _force_eval = True
     if not state["fire_gas_alarm"]:
-        GPIO.output(BUZZER_PIN, GPIO.LOW)
         fan_off()
         led_off()
     print(f"[LIVING ROOM] Về chế độ AUTO bởi {source}")
@@ -630,10 +628,10 @@ def trigger_fire_gas_alarm(level: str, context: str, details: dict | None = None
     _btn_override["led"] = False     # báo cháy/gas: bỏ ghi đè của nút
     _btn_override["fan"] = False
 
-    fan_on(3)                        # báo cháy/gas: quạt mức cao nhất
+    # Báo cháy/gas: phần cứng phòng khách chỉ MỘT mức (mọi level như nhau):
+    # quạt mức cao nhất để thông gió + bật đèn. Không còi, không tự mở cửa.
+    fan_on(3)
     led_on()
-    if level in ("MAX", "RED"):
-        GPIO.output(BUZZER_PIN, GPIO.HIGH)
 
     payload = {
         "type": "fire_gas",
@@ -654,9 +652,7 @@ def clear_fire_gas_alarm():
     
     state["fire_gas_alarm"] = False
     state["fire_gas_level"] = "CLEAR"
-    # Luôn tắt còi (lúc cháy cửa thoát hiểm được mở nên không phụ thuộc trạng thái cửa)
-    GPIO.output(BUZZER_PIN, GPIO.LOW)
-    # Giống ALARM_OFF bên C: xoá manual + override, tắt quạt/đèn
+    # Giống ALARM_OFF bên C: khôi phục đèn/quạt như trước khi báo động
     
     if snap is None:
         set_auto("alarm_clear")
@@ -998,7 +994,6 @@ def stop():
     try:
         fan_off()
         led_off()
-        GPIO.output(BUZZER_PIN, GPIO.LOW)
         GPIO.output(BTN_LED_SIG1, GPIO.LOW)
         GPIO.output(BTN_FAN_SIG1, GPIO.LOW)
         _servo_pwm.stop()
@@ -1006,7 +1001,7 @@ def stop():
         GPIO.output(FAN_INA_PIN, GPIO.LOW)
         # KHÔNG trả INA về input: GPIO.cleanup() mặc định đưa mọi chân về input,
         # INA bỏ trống bị điện trở kéo lên của module -> quạt tự quay khi gateway dừng/khởi động lại.
-        GPIO.cleanup([p for p in (PIR_PIN, REED_PIN, BUZZER_PIN, LED_PIN, SERVO_PIN,
+        GPIO.cleanup([p for p in (PIR_PIN, REED_PIN, LED_PIN, SERVO_PIN,
                                   BTN_LED_SIG2, BTN_FAN_SIG2, BTN_LED_SIG1, BTN_FAN_SIG1)])
     except Exception:
         pass

@@ -46,6 +46,9 @@ TOPIC_DOOR_STATUS = "home/livingroom/door/status"
 TOPIC_ALARM = "home/livingroom/alarm"
 TOPIC_FIRE_GAS = "home/fire_gas/alarm"
 TOPIC_FIRE_GAS_ACK = "home/fire_gas/ack"
+# Mức báo động gas/cháy cho app (retained): {"level": "CLEAR|MED|MAX|RED", "context", "reason", "occupied", "night", "ts"}.
+# App: MAX/RED = NGHIÊM TRỌNG -> màn hình cảnh báo + hỏi mở cửa (qua sinh trắc học) + gọi 114.
+TOPIC_GAS_LEVEL_SUFFIX = "kitchen/gas_sensor/level"
 TOPIC_HOUSE_STATUS = "home/gateway/status"
 
 # Topic cho app Android: smarthome/<room>/<device>/<metric>, payload là chuỗi thuần
@@ -100,7 +103,6 @@ TEMP_RISE_WINDOW_SEC = 10.0
 UNOCCUPIED_AFTER_SEC = 30 * 60
 NIGHT_START_HOUR = 23
 NIGHT_END_HOUR = 6
-NIGHT_UNLOCK_AFTER_SEC = 30
 DAY_ESCALATE_AFTER_SEC = 60
 COMMAND_REPEAT_SEC = 10
 
@@ -152,12 +154,13 @@ _kit_temp_history = []
 _danger_started_ts = None
 _safe_since = None         # thời điểm bắt đầu hết nguy hiểm (để giữ báo động thêm CLEAR_HOLD_SEC)
 _day_escalated = False
-_unlock_sent = False
+_door_locked_before_alarm = None   # cửa có đang khoá lúc bắt đầu báo động không (để khoá lại khi hết)
 _manual_ack_ts = 0.0
 _last_presence_ts = time.time()
 _last_command = {}
 _mqtt_client = None
 _last_gas_alert = None
+_last_gas_level_pub = None
 _device_states = {}
 _device_cmd_ts = {}        # (room, device) -> thời điểm app gửi lệnh gần nhất
 _last_fb_alarm = None      # (context, level) đã ghi lên Firebase, tránh ghi lặp mỗi giây
@@ -331,6 +334,25 @@ def _publish_gas_alert(active: bool):
     )
 
 
+# Mức báo động cho app: chỉ publish khi (level, context) đổi, retained để app mở lên giữa lúc báo động vẫn thấy.
+def _publish_gas_level(level: str, context: str):
+    global _last_gas_level_pub
+    key = (level, context)
+    if key == _last_gas_level_pub:
+        return
+    _last_gas_level_pub = key
+    payload = {
+        "level": level,
+        "context": context,
+        "reason": state.get("fire_gas_reason", "none") if level != "CLEAR" else "none",
+        "occupied": not _is_unoccupied() if level != "CLEAR" else None,
+        "night": _is_night(),
+        "ts": int(time.time()),
+    }
+    _publish_raw(f"{ROOT_TOPIC}/{TOPIC_GAS_LEVEL_SUFFIX}", json.dumps(payload, ensure_ascii=False),
+                 qos=1, retain=True)
+
+
 # Chuẩn hoá payload lệnh: nhiều app gửi ON/OFF, 1/0, true/false...
 def _normalize_switch_payload(raw: str):
     v = raw.strip().upper()
@@ -353,7 +375,13 @@ def _dispatch_hardware_command(room: str, device: str, is_on: bool) -> str:
         # Quy ước: ON = mở khoá, OFF = khoá lại
         # Servo quay mất ~0.6 s nên chạy trong thread riêng, không chặn luồng MQTT
         if is_on:
-            threading.Thread(target=living_room.unlock_door, kwargs={"source": "app"}, daemon=True).start()
+            # Đang báo gas/cháy: người dùng mở cửa thoát hiểm từ app (đã qua sinh trắc học) -> giữ cửa mở,
+            # không tự khoá lại; hết báo động gateway sẽ khoá lại nếu cửa đã đóng.
+            in_alarm = state["fire_gas_level"] != "CLEAR"
+            threading.Thread(target=living_room.unlock_door,
+                             kwargs={"source": "app_fire_gas" if in_alarm else "app",
+                                     "auto_relock": not in_alarm},
+                             daemon=True).start()
         else:
             threading.Thread(target=living_room.lock_door, daemon=True).start()
         return "ok"
@@ -973,13 +1001,20 @@ def _alarm_details():
     }
 
 
-def _set_fire_gas_alarm(context: str, level: str, unlock: bool = False):
-    global _unlock_sent, _last_fb_alarm
+def _set_fire_gas_alarm(context: str, level: str):
+    """Báo động gas/cháy.
+    - Phần cứng: MỘT mức duy nhất cho mọi level (còi bếp + còi phòng ngủ kêu mạnh nhất, quạt/đèn phòng khách bật).
+    - KHÔNG tự mở cửa: chỉ mở khi người dùng chọn trên app và đã qua sinh trắc học (app gửi door/set ON).
+    - level (MED/MAX/RED) chỉ dùng cho thông báo trên app."""
+    global _last_fb_alarm, _door_locked_before_alarm
+    if _door_locked_before_alarm is None:
+        _door_locked_before_alarm = bool(living_room.state["door_locked"])
     state["fire_gas_context"] = context
     state["fire_gas_level"] = level
     state["fire_gas_reason"] = ",".join(_danger_reasons())
 
     _publish_gas_alert(True)
+    _publish_gas_level(level, context)
 
     # Firebase: chỉ ghi khi đổi (context, level), không ghi lặp mỗi giây
     if (context, level) != _last_fb_alarm:
@@ -991,17 +1026,8 @@ def _set_fire_gas_alarm(context: str, level: str, unlock: bool = False):
     # Còi phòng ngủ luôn kêu mạnh nhất khi có báo động, bất kể mức MED/MAX/RED
     send_command("bedroom", "ALARM_MAX")
 
-    # Phòng khách: bật đèn/quạt (không dùng còi)
+    # Phòng khách: bật đèn/quạt (phòng khách không có còi)
     living_room.trigger_fire_gas_alarm(level, context, _alarm_details())
-
-    if unlock and not _unlock_sent:
-        # auto_relock=False: giữ cửa mở làm lối thoát hiểm, không tự khoá lại sau vài giây
-        threading.Thread(
-            target=living_room.unlock_door,
-            kwargs={"source": f"fire_gas_{context}", "auto_relock": False},
-            daemon=True,
-        ).start()
-        _unlock_sent = True
 
 
 def _send_alarm_off_repeated():
@@ -1021,7 +1047,7 @@ def _send_alarm_off_repeated():
 
 
 def _clear_fire_gas_alarm():
-    global _danger_started_ts, _day_escalated, _unlock_sent, _last_fb_alarm, _safe_since
+    global _danger_started_ts, _day_escalated, _last_fb_alarm, _safe_since, _door_locked_before_alarm
     if state["fire_gas_level"] != "CLEAR":
         _send_alarm_off_repeated()
         living_room.clear_fire_gas_alarm()
@@ -1035,12 +1061,14 @@ def _clear_fire_gas_alarm():
             event_type="fire_gas_clear",
         )
 
-        # Hết báo động thì khoá cửa lại (nếu lúc báo động đã mở cửa thoát hiểm
-        # và cửa đang đóng hẳn; nếu cửa còn mở thì để nguyên, người dùng tự khoá qua app)
-        if _unlock_sent and not living_room.state["door_open"]:
+        # Người dùng mở cửa từ app trong lúc báo động thì cửa KHÔNG tự khoá lại (lối thoát hiểm).
+        # Hết báo động: cửa đang đóng hẳn mà chưa khoá -> khoá lại; cửa còn mở thì để người dùng tự xử lý.
+        if (_door_locked_before_alarm and not living_room.state["door_locked"]
+                and not living_room.state["door_open"]):
             threading.Thread(target=living_room.lock_door, daemon=True).start()
 
     _publish_gas_alert(False)
+    _publish_gas_level("CLEAR", "clear")
 
     state["fire_gas_context"] = "clear"
     state["fire_gas_level"] = "CLEAR"
@@ -1048,8 +1076,8 @@ def _clear_fire_gas_alarm():
     _danger_started_ts = None
     _safe_since = None
     _day_escalated = False
-    _unlock_sent = False
     _last_fb_alarm = None
+    _door_locked_before_alarm = None
 
 
 def evaluate_fire_gas_context():
@@ -1085,23 +1113,23 @@ def evaluate_fire_gas_context():
 
     danger_age = now - _danger_started_ts
 
+    # Ngữ cảnh chỉ quyết định MỨC THÔNG BÁO trên app (phần cứng báo giống nhau ở mọi mức):
+    #   RED  = nhà vắng 30 phút      -> app: NGHIÊM TRỌNG (KHẨN CẤP)
+    #   MAX  = đêm có người ngủ, hoặc ban ngày quá 60 s chưa xử lý -> app: NGHIÊM TRỌNG (NGUY HIỂM)
+    #   MED  = ban ngày có người / người dùng đã bấm "Đã xử lý" -> app: cảnh báo thường
     if _is_unoccupied():
-        _set_fire_gas_alarm("unoccupied", "RED", unlock=True)
+        _set_fire_gas_alarm("unoccupied", "RED")
         return
 
     if _is_night() and state["bed_motion"]:
-        _set_fire_gas_alarm(
-            "night_sleeping",
-            "MAX",
-            unlock=danger_age >= NIGHT_UNLOCK_AFTER_SEC,
-        )
+        _set_fire_gas_alarm("night_sleeping", "MAX")
         return
 
     if danger_age >= DAY_ESCALATE_AFTER_SEC:
         _day_escalated = True
 
     if _day_escalated:
-        _set_fire_gas_alarm("day_occupied_escalated", "MAX", unlock=True)
+        _set_fire_gas_alarm("day_occupied_escalated", "MAX")
     else:
         _set_fire_gas_alarm("day_occupied", "MED")
 
